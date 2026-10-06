@@ -42,7 +42,7 @@ import type { GatewayCredential, GatewayProvider, LoadProviderCredential, Resolv
 import { isEventStreamContentType, isJsonContentType, trackStream, readBoundedBody, RequestBodyLimitError, upstreamLifetime } from "./relay.js"
 import { env } from "./env.js"
 import { createRequestLogRecorder } from "./request-log.js"
-import { checkGatewayUsage, type CheckGatewayUsage } from "./usage-limits.js"
+import { admitGatewayUsage, checkGatewayUsage, enforceUsageAdmissionForAll, type CheckGatewayUsage, type UsageAdmissionPolicy } from "./usage-admission.js"
 import type { InsertRequestLog, RequestLogRecorder, RequestLogRecorderDependencies } from "./request-log.js"
 import { createAnthropicMessagesSseUsageParser, parseAnthropicMessagesJsonUsage } from "./usage/anthropic-messages.js"
 import {
@@ -71,6 +71,8 @@ export type LoadGatewayProvider = (input: {
 
 export type GatewayDependencies = {
   checkUsage: CheckGatewayUsage
+  /** Whether admission runs for an organization. Accounting always runs. */
+  usageAdmission: UsageAdmissionPolicy
   fetch: typeof fetch
   insertRequestLog: InsertRequestLog
   updateRequestLog?: RequestLogRecorderDependencies["updateRequestLog"]
@@ -677,6 +679,7 @@ function restOfPath(pathname: string, inferenceProviderId: string) {
 export function registerGatewayRoutes(api: Hono<GatewayEnv>, input: GatewayRouteDependencies) {
   const dependencies: GatewayDependencies = {
     checkUsage: input.checkUsage ?? checkGatewayUsage,
+    usageAdmission: input.usageAdmission ?? enforceUsageAdmissionForAll,
     fetch: input.fetch,
     insertRequestLog: input.insertRequestLog,
     updateRequestLog: input.updateRequestLog,
@@ -730,7 +733,7 @@ export function registerGatewayRoutes(api: Hono<GatewayEnv>, input: GatewayRoute
     let selection: GatewayGrantSelection | null = null
     const headerModel = c.req.header(GATEWAY_REQUEST_MODEL_HEADER)
     const modelHint = parseGatewayModelAlias(headerModel) ? headerModel ?? null : null
-    let gatewayUsage: import("@openwork-ee/den-db/gateway-usage-limits").GatewayUsageSnapshot | undefined
+    let gatewayUsage: import("@openwork-ee/den-db/gateway-usage-accounting").GatewayUsageSnapshot | undefined
     const recorder = createRequestLogRecorder({ insertRequestLog: dependencies.insertRequestLog, updateRequestLog: dependencies.updateRequestLog, reporter: dependencies.reporter, now: dependencies.now })
     const startRecorder = (state: {
       protocol: GatewayRequestProtocol
@@ -911,7 +914,7 @@ export function registerGatewayRoutes(api: Hono<GatewayEnv>, input: GatewayRoute
     }
 
     if (auth.kind === "signer") prepared.url.host = auth.host
-    const usageRejection = await dependencies.checkUsage({
+    const usageRejection = await admitGatewayUsage(dependencies, c.get("organization") ?? null, {
       organizationId: identity.organizationId,
       memberId: identity.orgMembershipId,
       requestId: openworkRequestId,
