@@ -22,7 +22,7 @@ import {
 } from "../capability-sources/external-mcp-connections.js"
 import { memberFacingMcpConnectionsEnabled } from "../capability-sources/external-mcp-rollout.js"
 import { organizationHasCapability } from "../organization-capabilities.js"
-import { getOpenWorkWebRuntimeAccess } from "../openwork-web-runtime-access.js"
+import { getOpenWorkWebRuntimeAccess } from "../openwork-web/runtime-access.js"
 import { listTeamsForMember } from "../orgs.js"
 import { canUseSlackAssistant, scopeKey, slackClient, type SlackEvent } from "./protocol.js"
 import { slackRuntimeForOrganization, type SlackRuntime } from "./headless.js"

@@ -4,6 +4,7 @@ import { delegatedRoute } from "../../middleware/index.js"
 import { registerOrgApiKeyRoutes } from "./api-keys.js"
 import { registerOrgAuditRoutes } from "./audit.js"
 import { registerOrgBillingRoutes } from "./billing.js"
+import { registerOpenWorkWebAccessRoutes } from "../../openwork-web/routes.js"
 import { registerOrgBrandAssetRoutes } from "./brand-assets.js"
 import { registerOrgWorkflowRunRoutes } from "./codemode-runs.js"
 import { registerOrgWorkflowRoutes } from "./codemode-scripts.js"
@@ -66,6 +67,7 @@ export function registerOrgRoutes<T extends { Variables: OrgRouteVariables & Req
   registerDeleteOrganizationRoutes(app)
   registerOrgApiKeyRoutes(app)
   registerOrgAuditRoutes(app)
+  registerOpenWorkWebAccessRoutes(app)
   registerOrgBillingRoutes(app)
   registerOrgBrandAssetRoutes(app)
   registerOrgWorkflowRunRoutes(app)
