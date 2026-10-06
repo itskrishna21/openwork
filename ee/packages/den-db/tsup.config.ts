@@ -16,6 +16,7 @@ export default defineConfig({
     "schema/telemetry": "src/schema/telemetry.ts",
     drizzle: "src/drizzle.ts",
     "gateway-usage-limits": "src/gateway-usage-limits.ts",
+    "inference-keys": "src/inference-keys.ts",
     "audit-log": "src/audit-log.ts",
     "audit-accounting": "src/audit-accounting.ts",
   },
