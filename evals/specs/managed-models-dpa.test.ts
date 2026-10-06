@@ -234,6 +234,10 @@ test("DPA policy blocks warm managed keys without revoking customer-owned models
   }
   const rawCreate = await denFetch(admin, "/api/auth/organization/create", { method: "POST", headers: { cookie }, body: JSON.stringify({ name: "Raw DPA", slug: `raw-${world.orgId}`, metadata: { dpaSigned: true } }) });
   expect(rawCreate.response.status, rawCreate.text).toBe(403);
+  for (const metadata of [{ capabilities: { orgManagedDashboards: true, modelsAnalytics: true } }, undefined]) {
+    const rawCapabilityCreate = await denFetch(admin, "/api/auth/organization/create", { method: "POST", headers: { cookie }, body: JSON.stringify({ name: "Raw Capabilities", slug: `raw-cap-${world.orgId}`, metadata }) });
+    expect(rawCapabilityCreate.response.status, rawCapabilityCreate.text).toBe(403);
+  }
   expect(record((await fixture()).metadata).dpaSigned).toBe(true);
   expect(list((await fixture()).audits)).toHaveLength(1);
   await blocked();

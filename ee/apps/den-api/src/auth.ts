@@ -4,6 +4,7 @@ import { invalidateTeamInferenceOAuth, revokeMemberGatewayCredentials } from "./
 import { ensureMemberGatewayKey } from "./gateway-keys.js";
 import { getInitialActiveOrganizationIdForUser } from "./active-organization.js";
 import { db } from "./db.js";
+import { checkOrganizationCreateMetadata } from "./organization-reserved-metadata.js";
 import { resolveOrganizationMemberAuthority } from "./organization-team-roles.js";
 import { env } from "./env.js";
 import { appLogger } from "./observability/logger.js";
@@ -332,6 +333,7 @@ function removedMemberIdentity(value: unknown): { id: string; organizationId: st
 }
 
 const RAW_BETTER_AUTH_MUTATION_DENIALS: readonly (readonly [string, string])[] = [
+  ["/organization/create", "Use the Den organization API to create workspaces."],
   ["/organization/update", "Use the Den organization settings API to update workspace configuration."],
   ["/organization/delete", "Workspace deletion through Better Auth is disabled."],
   ["/organization/update-member-role", "Use the Den member role API to change organization roles."],
@@ -1218,25 +1220,12 @@ export const auth = betterAuth({
           } catch {
             throw new APIError("BAD_REQUEST", { message: "Organization metadata must be a JSON object." });
           }
-          if ("dpaSigned" in metadata) {
-            throw new APIError("FORBIDDEN", { message: "dpaSigned is reserved for internal platform administration." });
+          const checked = checkOrganizationCreateMetadata(metadata);
+          if (!checked.ok) {
+            throw new APIError("FORBIDDEN", { message: `${checked.reservedKey} is reserved for internal platform administration.` });
           }
-          if ("plan" in metadata) {
-            throw new APIError("FORBIDDEN", { message: "plan is reserved for internal platform administration." });
-          }
-          const capabilities = metadata.capabilities;
-          if (capabilities && typeof capabilities === "object" && "auditLogs" in capabilities) {
-            throw new APIError("FORBIDDEN", { message: "capabilities.auditLogs is reserved for internal platform administration." });
-          }
-          for (const key of ["slackAssistant", "slackAssistantHeadless", "headlessAutomations", "workbot"]) {
-            if (capabilities && typeof capabilities === "object" && key in capabilities) {
-              throw new APIError("FORBIDDEN", { message: `capabilities.${key} is reserved for internal platform administration.` });
-            }
-          }
-          if (capabilities && typeof capabilities === "object" && "gatewayDashboard" in capabilities) {
-            const retainedCapabilities = { ...capabilities };
-            delete retainedCapabilities.gatewayDashboard;
-            return { data: { metadata: { ...metadata, capabilities: retainedCapabilities } } };
+          if (checked.metadata) {
+            return { data: { metadata: checked.metadata } };
           }
         },
         beforeUpdateOrganization: async ({ organization }) => {
