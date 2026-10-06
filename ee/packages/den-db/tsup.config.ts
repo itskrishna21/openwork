@@ -15,6 +15,7 @@ export default defineConfig({
     "schema/system": "src/schema/system.ts",
     "schema/telemetry": "src/schema/telemetry.ts",
     drizzle: "src/drizzle.ts",
+    "gateway-usage-accounting": "src/gateway-usage-accounting.ts",
     "gateway-usage-limits": "src/gateway-usage-limits.ts",
     "audit-log": "src/audit-log.ts",
     "audit-accounting": "src/audit-accounting.ts",
