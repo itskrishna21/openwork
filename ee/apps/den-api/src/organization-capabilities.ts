@@ -9,7 +9,7 @@ import { z } from "zod"
  * semantics for member-facing surfaces.
  *
  * Storage rides the existing organization metadata JSON column — the same
- * home as `limits`, `plan`, and `requireSso` — so no schema change is needed.
+ * home as `limits`, `plan`, and `allowedDesktopVersions` — so no schema change is needed.
  */
 export const ORGANIZATION_CAPABILITY_KEYS = ["installLinks", "mcpConnections", "modelsAnalytics", "auditLogs", "orgManagedDashboards", "appMcpServers", "slackAssistant", "slackAssistantHeadless", "headlessAutomations", "workbot"] as const
 

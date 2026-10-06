@@ -20,7 +20,6 @@ import { findEnterpriseAuthRequirementForEmailDomain, resolveNonSsoSignInMethodF
 import { jsonValidator, orgMemberRoute, orgRoleRoute, publicRoute, queryValidator, resolveMemberTeamsMiddleware, userSessionRoute } from "../../middleware/index.js"
 import { denTypeIdSchema, enterprisePlanRequiredSchema, forbiddenSchema, invalidRequestSchema, jsonResponse, notFoundSchema, unauthorizedSchema } from "../../openapi.js"
 import { validateInvitationAcceptVerification } from "../../organization-join-verification.js"
-import { normalizeOrganizationMetadata } from "../../organization-limits.js"
 import { organizationHasCapability, organizationManagedDashboardsEnabled } from "../../organization-capabilities.js"
 import { appMcpServersEnabled } from "../../mcp-app-rollout.js"
 import { workbotOrigin } from "../../workbot/config.js"
@@ -49,18 +48,28 @@ const createOrganizationSchema = z.object({
   name: z.string().trim().min(2).max(120),
 }).strict()
 
-const updateOrganizationSchema = z.object({
+const updateOrganizationFieldsSchema = z.object({
   name: z.string().trim().min(2).max(120).optional(),
   allowedEmailDomains: z.array(z.string().trim().min(1).max(255)).max(100).nullable().optional(),
   allowedDesktopVersions: z.array(z.string().trim().min(1).max(32)).max(200).nullable().optional(),
-  requireSso: z.boolean().optional(),
   brandAppName: z.string().trim().min(1).max(64).nullable().optional(),
   brandLogoUrl: z.string().url().max(2048).nullable().optional(),
   brandIconUrl: z.string().url().max(2048).nullable().optional(),
   brandAccentColor: z.string().trim().min(1).max(32).nullable().optional(),
-}).strict().refine((value) => value.name !== undefined || value.allowedEmailDomains !== undefined || value.allowedDesktopVersions !== undefined || value.requireSso !== undefined || value.brandAppName !== undefined || value.brandLogoUrl !== undefined || value.brandIconUrl !== undefined || value.brandAccentColor !== undefined, {
+}).strict().refine((value) => value.name !== undefined || value.allowedEmailDomains !== undefined || value.allowedDesktopVersions !== undefined || value.brandAppName !== undefined || value.brandLogoUrl !== undefined || value.brandIconUrl !== undefined || value.brandAccentColor !== undefined, {
   message: "Provide at least one organization field to update.",
 })
+
+// Compat window (D19, W0-P13 PR C): the inert `requireSso` org setting was
+// removed. Stale clients may still send it, so drop the key before strict
+// validation and apply the other fields. Remove in Phase 6.
+function stripRetiredRequireSso(value: unknown): unknown {
+  if (typeof value !== "object" || value === null || Array.isArray(value) || !("requireSso" in value)) return value
+  const { requireSso: _retired, ...rest } = value
+  return rest
+}
+
+const updateOrganizationSchema = z.preprocess(stripRetiredRequireSso, updateOrganizationFieldsSchema)
 
 const resolveSsoByEmailQuerySchema = z.object({
   email: z.string().trim().email(),
@@ -466,7 +475,7 @@ export function registerOrgCoreRoutes<T extends { Variables: OrgRouteVariables }
         200: jsonResponse("Organization updated successfully.", organizationResponseSchema),
         400: jsonResponse("The organization update request body was invalid, contained malformed email domains, or contained an invalid brand icon URL.", updateOrganizationBadRequestSchema),
         401: jsonResponse("The caller must be signed in to update an organization.", unauthorizedSchema),
-        402: jsonResponse("Enabling enforced SSO or desktop version controls requires an Enterprise plan.", enterprisePlanRequiredSchema),
+        402: jsonResponse("Enabling desktop version controls requires an Enterprise plan.", enterprisePlanRequiredSchema),
         403: jsonResponse("The caller does not have permission to update the requested organization fields.", forbiddenSchema),
         404: jsonResponse("The organization could not be found.", notFoundSchema),
       },
@@ -493,10 +502,8 @@ export function registerOrgCoreRoutes<T extends { Variables: OrgRouteVariables }
         }, 400)
       }
 
-      const currentMetadata = normalizeOrganizationMetadata(payload.organization.metadata).metadata
-      const enablesRequireSso = input.requireSso === true && currentMetadata.requireSso !== true
       const enablesVersionPinning = Array.isArray(input.allowedDesktopVersions) && input.allowedDesktopVersions.length > 0
-      if (enablesRequireSso || enablesVersionPinning) {
+      if (enablesVersionPinning) {
         const entitlement = checkEntitlement(payload.organization.metadata, "orgControls")
         if (!entitlement.ok) {
           return c.json(entitlement.response, entitlement.status)
@@ -527,7 +534,6 @@ export function registerOrgCoreRoutes<T extends { Variables: OrgRouteVariables }
         name: input.name,
         allowedEmailDomains: normalizedDomains.domains,
         allowedDesktopVersions: input.allowedDesktopVersions,
-        requireSso: input.requireSso,
         brandAppName: input.brandAppName,
         brandLogoUrl: input.brandLogoUrl,
         brandIconUrl: input.brandIconUrl,

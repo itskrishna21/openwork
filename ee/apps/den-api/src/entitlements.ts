@@ -27,7 +27,7 @@ export type EnterprisePlanRequiredError = {
 const ENTITLEMENT_FEATURE_LABELS: Record<EntitlementKey, string> = {
   sso: "SSO / SAML",
   desktopPolicies: "Desktop policies",
-  orgControls: "Enforced SSO and desktop version controls",
+  orgControls: "Desktop version controls",
   analytics: "Usage analytics",
   auditLogs: "Audit logs",
 }

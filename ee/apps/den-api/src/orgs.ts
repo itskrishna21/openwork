@@ -1315,7 +1315,6 @@ export async function updateOrganizationSettings(input: {
   name?: string
   allowedEmailDomains?: readonly string[] | null
   allowedDesktopVersions?: readonly string[] | null
-  requireSso?: boolean
   brandAppName?: string | null
   brandLogoUrl?: string | null
   brandIconUrl?: string | null
@@ -1336,7 +1335,7 @@ export async function updateOrganizationSettings(input: {
     if (input.allowedEmailDomains !== undefined) {
       updates.allowedEmailDomains = normalizeAllowedEmailDomains(input.allowedEmailDomains).domains
     }
-    if (input.allowedDesktopVersions !== undefined || input.requireSso !== undefined || input.brandAppName !== undefined || input.brandLogoUrl !== undefined || input.brandIconUrl !== undefined || input.brandLogoAsset !== undefined || input.brandIconAsset !== undefined || input.brandAccentColor !== undefined) {
+    if (input.allowedDesktopVersions !== undefined || input.brandAppName !== undefined || input.brandLogoUrl !== undefined || input.brandIconUrl !== undefined || input.brandLogoAsset !== undefined || input.brandIconAsset !== undefined || input.brandAccentColor !== undefined) {
       const rows = await tx
         .select({ metadata: OrganizationTable.metadata })
         .from(OrganizationTable)
@@ -1359,10 +1358,6 @@ export async function updateOrganizationSettings(input: {
         } else {
           nextMetadata.allowedDesktopVersions = input.allowedDesktopVersions
         }
-      }
-
-      if (input.requireSso !== undefined) {
-        nextMetadata.requireSso = input.requireSso
       }
 
       if (input.brandAppName !== undefined) {

@@ -7773,7 +7773,6 @@ export type PatchV1OrgData = {
     name?: string;
     allowedEmailDomains?: Array<string> | null;
     allowedDesktopVersions?: Array<string> | null;
-    requireSso?: boolean;
     brandAppName?: string | null;
     brandLogoUrl?: string | null;
     brandIconUrl?: string | null;
@@ -7794,7 +7793,7 @@ export type PatchV1OrgErrors = {
    */
   401: UnauthorizedError;
   /**
-   * Enabling enforced SSO or desktop version controls requires an Enterprise plan.
+   * Enabling desktop version controls requires an Enterprise plan.
    */
   402: EnterprisePlanRequiredError;
   /**
