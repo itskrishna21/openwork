@@ -266,7 +266,6 @@ async function handleMcpAppServerRequestUntimed(input: {
     organizationId,
     member,
     redirectUriBase: resolvePublicOrigin(context.req.raw, env.apiPublicUrl),
-    generatedArtifactViewsEnabled: env.generatedArtifactViewsEnabled,
     organizationMetadata: organization[0]?.metadata,
   })
   const access = { organizationId, member, enabled: capabilityContext.externalMcpConnectionsEnabled, requestScope: {} }
