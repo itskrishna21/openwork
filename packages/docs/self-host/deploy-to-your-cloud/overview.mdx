@@ -1,9 +1,11 @@
 ---
 title: "Deploy to your cloud"
-description: "Run OpenWork in your AWS, Azure, or Google Cloud account with Kubernetes, Helm, and managed MySQL."
+description: "Use OpenWork's tested Kubernetes guides for AWS, Azure, and Google Cloud, or plan a deployment on another container platform."
 ---
 
-OpenWork's supported private-cloud shape uses the published Helm chart, a managed Kubernetes cluster, and a MySQL-compatible database in your own account. You control the network, DNS, certificates, database, backups, identity provider, and secrets; the chart deploys Den web, Den API, a migration Job, and optional OpenWork Gateway.
+OpenWork's tested private-cloud path uses the published Helm chart, a managed Kubernetes cluster, and a MySQL-compatible database in your own account. You control the network, DNS, certificates, database, backups, identity provider, and secrets; the chart deploys Den web, Den API, a migration Job, and optional OpenWork Gateway.
+
+Using another environment? Kubernetes is not required: [choose your deployment platform](/self-host/platforms/overview) for the draft ECS module and requirements for Docker, VMs, managed containers, and on-premises infrastructure. The sequence below applies to the Helm path.
 
 <CardGroup cols={3}>
   <Card title="AWS" icon="cloud" href="/self-host/deploy-to-your-cloud/aws">
