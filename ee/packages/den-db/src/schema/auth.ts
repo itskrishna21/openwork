@@ -137,11 +137,13 @@ export const OAuthClientTable = mysqlTable(
     id: denTypeIdColumn("oauthClient", "id").notNull().primaryKey(),
     clientId: varchar("client_id", { length: 255 }).notNull(),
     clientSecret: text("client_secret"),
+    clientDiscoveryId: varchar("client_discovery_id", { length: 64 }),
     disabled: boolean("disabled").default(false),
     skipConsent: boolean("skip_consent"),
     enableEndSession: boolean("enable_end_session"),
     subjectType: varchar("subject_type", { length: 64 }),
     scopes: text("scopes"),
+    clientCredentialsScopes: text("client_credentials_scopes"),
     userId: denTypeIdColumn("user", "user_id"),
     createdAt: timestamp("created_at", { fsp: 3 }).notNull().defaultNow(),
     updatedAt: timestamp("updated_at", { fsp: 3 })
@@ -161,6 +163,7 @@ export const OAuthClientTable = mysqlTable(
     tokenEndpointAuthMethod: varchar("token_endpoint_auth_method", { length: 128 }),
     grantTypes: text("grant_types"),
     responseTypes: text("response_types"),
+    applicationType: varchar("application_type", { length: 32 }),
     public: boolean("public"),
     type: varchar("type", { length: 64 }),
     requirePKCE: boolean("require_pkce"),
@@ -440,6 +443,24 @@ export const SsoConnectionTable = mysqlTable(
     uniqueIndex("sso_connection_provider_id").on(table.providerId),
     index("sso_connection_domain").on(table.domain),
   ],
+)
+
+/**
+ * Which organization's SSO a session was signed in through. Written when an
+ * SSO callback creates the session (or a device session approved by one), so
+ * an organization that requires SSO can tell an SSO session from a password
+ * or Google one. One row per session; removed with the session.
+ */
+export const SessionSsoAuthenticationTable = mysqlTable(
+  "session_sso_authentication",
+  {
+    sessionId: denTypeIdColumn("session", "session_id").notNull().primaryKey(),
+    userId: denTypeIdColumn("user", "user_id").notNull(),
+    organizationId: denTypeIdColumn("organization", "organization_id").notNull(),
+    ssoProviderId: varchar("sso_provider_id", { length: 255 }).notNull(),
+    createdAt: timestamp("created_at", { fsp: 3 }).notNull().defaultNow(),
+  },
+  (table) => [index("session_sso_authentication_org").on(table.organizationId), index("session_sso_authentication_user").on(table.userId)],
 )
 
 export const ExternalIdentityTable = mysqlTable(

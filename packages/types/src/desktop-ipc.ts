@@ -173,6 +173,15 @@ export type AppBuildInfo = {
   arch?: string | null;
 };
 
+/** This launch's startup milestones in epoch milliseconds; null until reached. */
+export type DesktopStartupTimings = {
+  processStartedAt: number;
+  windowShownAt: number | null;
+  engineSettledAt: number | null;
+  /** How the launch's first runtime boot settled; "skipped" means no local workspace. */
+  engine: "ready" | "failed" | "skipped" | null;
+};
+
 export type DesktopDistributionInfo = {
   flavor: "public" | "enterprise";
   appName: string;
@@ -318,7 +327,7 @@ export type DesktopFetchResult = {
  * resolves elsewhere is shown in its folder instead of being handed to an application.
  */
 export type DesktopWorkspaceFileOpenResult =
-  | { ok: true; action: "opened" | "revealed" }
+  | { ok: true; action: "opened" | "revealed" | "unavailable" }
   | { ok: false; error: string };
 
 export type DesktopBinaryDownloadResult = {
@@ -341,11 +350,90 @@ export type UiControlBridgeInfo = {
   token?: string;
 };
 
+export type ComputerPermission = "accessibility" | "screenRecording";
+
+/** The agent needs computer use this chat does not have yet: setup, or the person's allowance. */
+export type ComputerRequest = {
+  id: string;
+  /** setup: macOS permissions or a remote connection; script: an app script waiting for the person's approval; files: files an app or page is about to receive; credential: the browser is about to type a password or code on a site. */
+  reason: "setup" | "script" | "files" | "credential";
+  /** The computer the chat uses, e.g. "This Mac" or "Freestyle VM". */
+  computer: string;
+  placement: "local" | "remote";
+  /** What a remote computer still needs; macOS setup uses the checklist instead. */
+  detail?: string;
+  appId?: string;
+  purpose?: string;
+  /** False when organization policy requires approval of each individual script or browser upload. */
+  standing?: boolean;
+  /** The exact script that runs if the person approves it. */
+  script?: { app: "applescript" | "jxa" | "blender"; code: string };
+  /** The files handed over if the person approves: names or full paths, and the app or site receiving them. */
+  files?: { app: string; names: string[]; site?: string; canRemember?: boolean };
+  /** Where the agent would type a password or one-time code: an exact site (origin) in the built-in browser, or a native app by name and id. */
+  credential?: { site?: string; app?: string; appId?: string };
+};
+
+/** One chat's computer use state, as the broker reports it. */
+export type ComputerSnapshot = {
+  revision: number;
+  /** Usable right now (allowed and not paused after an automatic stop this turn). */
+  enabled: boolean;
+  /** The app macOS lists in System Settings for these permissions; `ours` when OpenWork can reset it. */
+  entry: { name: string; ours: boolean };
+  request: ComputerRequest | null;
+  /** The computer this chat uses, and every computer it could use (this Mac, connected VMs). */
+  targetId: string;
+  targets: { id: string; label: string; placement: "local" | "remote" }[];
+  placement: "local" | "remote";
+  readiness: "ready" | "setup-required" | "unsupported" | "unavailable";
+  permissions?: { accessibility: boolean; screenRecording: boolean };
+  detail: string;
+  busyElsewhere: boolean;
+  session: {
+    state: string;
+    purpose: string;
+    appName?: string;
+    windowTitle?: string;
+    phase?: string;
+    expiresAt?: string;
+    reason?: string;
+  } | null;
+  cleanupPending?: boolean;
+  /** This chat's computer steps: time spent on the computer, and waiting for the model between steps. */
+  timing?: { steps: number; computerMs: number; modelMs: number; last?: { name: string; computerMs: number; modelMs?: number } };
+};
+
+/** Settings: the computer every chat uses and whether it is set up. */
+export type ComputerStatus = Pick<ComputerSnapshot, "enabled" | "entry" | "targetId" | "targets" | "placement" | "readiness" | "permissions" | "detail">;
+
+/** The live watch view: recent redacted frames and dispatched input, never actionable. */
+export type ComputerPresentation = {
+  id: string;
+  phase: "working" | "paused" | "closed";
+  appName?: string;
+  windowTitle?: string;
+  task?: string;
+  mode?: string;
+  status?: string;
+  canContinue?: boolean;
+  frame?: { sequence: number; capturedAt: number; width: number; height: number; mimeType: "image/png"; data: string };
+  inputs: { sequence: number; at: number; action: string; phase: string; x?: number; y?: number }[];
+};
+
 // ---------------------------------------------------------------------------
 // The command map
 // ---------------------------------------------------------------------------
 
 export type DesktopCommandMap = {
+  __startNativeDictation: { args: [requestId: string]; result: { ok: true } | { ok: false; reason: "unavailable" | "not_focused" | "failed" } };
+  __cancelNativeDictationStart: { args: [requestId: string]; result: boolean };
+  // Bundled speech helper: "local" is Apple's on-device recognizer, "online"
+  // Windows' online speech recognition. Results arrive on the dictation event channel.
+  __speechDictationMode: { args: []; result: "local" | "online" | null };
+  __startSpeechDictation: { args: [requestId: string, language: string]; result: { ok: true } | { ok: false; reason: "unavailable" | "not_focused" | "failed" } };
+  __stopSpeechDictation: { args: [requestId: string]; result: boolean };
+  __abortSpeechDictation: { args: [requestId: string]; result: boolean };
   // Workspace state
   workspaceBootstrap: { args: []; result: WorkspaceList };
   workspaceSetSelected: { args: [workspaceId: string]; result: WorkspaceList };
@@ -371,6 +459,7 @@ export type DesktopCommandMap = {
 
   // App / bridge info
   appBuildInfo: { args: []; result: AppBuildInfo };
+  startupTimings: { args: []; result: DesktopStartupTimings };
   desktopNotificationShow: {
     args: [input: DesktopNotificationInput];
     result: DesktopNotificationResult;
@@ -380,6 +469,8 @@ export type DesktopCommandMap = {
     result: { enabled: boolean };
   };
   desktopSentryClearSession: { args: []; result: { enabled: boolean } };
+  /** Keep the computer from sleeping while this window's agents are working. */
+  desktopSetKeepAwake: { args: [active: boolean]; result: { active: boolean } };
   desktopIntegrationStatus: { args: []; result: DesktopIntegrationStatus };
   desktopIntegrationInstall: {
     args: [options?: { useExternalLauncher?: boolean }];
@@ -389,6 +480,31 @@ export type DesktopCommandMap = {
   getUiControlBridgeInfo: { args: []; result: UiControlBridgeInfo | null };
   getOpenworkUiMcpCommand: { args: []; result: string[] };
   getOpenworkUiMcpEnvironment: { args: []; result: Record<string, string> };
+
+  // Computer use (macOS): chat ownership, the watch view and permission setup
+  computerSnapshot: { args: [sessionId: string]; result: ComputerSnapshot };
+  computerStatus: { args: []; result: ComputerStatus };
+  computerPresentation: { args: [sessionId: string, visible: boolean]; result: ComputerPresentation | null };
+  computerInteract: {
+    args: [input: { sessionId: string; id: string; action: "takeover" | "resume" }];
+    result: void;
+  };
+  computerSetup: { args: [permission: ComputerPermission]; result: { setupId: string } };
+  computerDismissSetup: { args: [setupId?: string]; result: void };
+  computerChoose: { args: [targetId: string]; result: ComputerStatus };
+  computerHalt: { args: [sessionId: string]; result: ComputerSnapshot };
+  computerAnswerRequest: { args: [input: { sessionId: string; answer: "dismiss" | "allow" | "always" | "remember"; id?: string }]; result: ComputerSnapshot };
+  computerListFileGrants: { args: []; result: { enabled: boolean; grants: Array<{ id: string; origin: string; folder: string; blocked?: boolean }> } };
+  computerRemoveFileGrant: { args: [id: string]; result: { ok: boolean } };
+  computerSetFeatureEnabled: { args: [enabled: boolean]; result: boolean };
+  agentQuestionsSetEnabled: { args: [enabled: boolean]; result: boolean };
+  computerSetRemoteEnabled: { args: [enabled: boolean]; result: boolean };
+  /** Reports the `standardCodeMode` feature: computer programs that start afterwards run as standard JavaScript. */
+  computerSetStandardCodeMode: { args: [enabled: boolean]; result: boolean };
+  /** Compatibility-only no-op for older renderers; returns the computerUse state. */
+  computerSetBackgroundEnabled: { args: [enabled: boolean]; result: boolean };
+  computerResetPermission: { args: [permission: ComputerPermission]; result: { setupId: string } };
+  computerEndTurn: { args: [sessionId: string]; result: boolean };
 
   // Bootstrap config
   getDesktopBootstrapConfig: { args: []; result: DesktopBootstrapConfig };
@@ -475,8 +591,9 @@ export type DesktopCommandMap = {
   // Window / OS utilities (dunder commands)
   __showContextMenu: { args: [request: NativeContextMenuRequest]; result: string | null };
   __cancelContextMenu: { args: [requestId: string]; result: boolean };
+  __resolveChatFilePath: { args: [target: string]; result: string | null };
   __openPath: { args: [target: string]; result: unknown };
-  __openWorkspaceFile: { args: [workspaceRoot: string, target: string]; result: DesktopWorkspaceFileOpenResult };
+  __openWorkspaceFile: { args: [workspaceRoot: string, target: string, options?: { reveal?: boolean }]; result: DesktopWorkspaceFileOpenResult };
   __revealItemInDir: { args: [target: string]; result: unknown };
   __applyBrandAppName: { args: [appName: string | null]; result: { ok: true; appName: string } };
   __applyBrandIcon: { args: [url: string | null]; result: BrandIconApplyResult };

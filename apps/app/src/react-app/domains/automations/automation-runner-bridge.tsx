@@ -2,8 +2,11 @@
 import { useEffect } from "react"
 import {
   AUTOMATION_MODEL_ATTENTION_CAPABILITY,
+  REMOTE_SESSION_ANSWER_RUNNER_CAPABILITY,
   REMOTE_SESSION_CONTROL_RUNNER_CAPABILITY,
   REMOTE_SESSION_DESKTOP_RUNNER_CAPABILITY,
+  REMOTE_SESSION_RECOVERY_RUNNER_CAPABILITY,
+  REMOTE_SESSION_ONLY_RUNNER_CAPABILITY,
 } from "@openwork/types/automations"
 import type {
   AutomationDesktopRunnerCapability,
@@ -15,7 +18,7 @@ import { denSettingsChangedEvent } from "@/app/lib/den-session-events"
 import { isDesktopRuntime } from "@/app/utils"
 import { useDenAuth } from "@/react-app/domains/cloud/den-auth-provider"
 import { useEnterpriseActivationRequired } from "@/react-app/domains/cloud/enterprise-activation-gate"
-import { useAutomationDeploymentEnabled } from "./automation-availability"
+import { useDesktopAutomationsEnabled } from "./automation-availability"
 import { createAutomationRunnerConnectCoordinator } from "./automation-runner-connect-coordinator"
 import { organizationRunnerId } from "./automation-runner-identity"
 
@@ -43,7 +46,7 @@ export function AutomationRunnerBridge() {
 
 function ActivatedAutomationRunnerBridge() {
   const { status } = useDenAuth()
-  const deploymentEnabled = useAutomationDeploymentEnabled()
+  const deploymentEnabled = useDesktopAutomationsEnabled()
 
   useEffect(() => {
     if (!isDesktopRuntime() || !window.__OPENWORK_ELECTRON__?.invokeDesktop) return
@@ -53,7 +56,7 @@ function ActivatedAutomationRunnerBridge() {
     const coordinator = createAutomationRunnerConnectCoordinator({
       refreshMs: RUNNER_TOKEN_REFRESH_MS,
       connect: async (isCurrent) => {
-        if (!deploymentEnabled || status !== "signed_in") {
+        if (status !== "signed_in") {
           await disconnect()
           return
         }
@@ -71,6 +74,7 @@ function ActivatedAutomationRunnerBridge() {
           if (!isCurrent()) return
           const agent = navigator.userAgent
           const platform = /Mac/i.test(agent) ? "darwin" : /Win/i.test(agent) ? "win32" : "linux"
+          const mintToken = deploymentEnabled ? client.mintAutomationRunnerToken : client.mintSessionRunnerToken
           const mintRunner = async (id: string) => {
             const registration = (
               capabilities: AutomationDesktopRunnerCapability[],
@@ -86,7 +90,16 @@ function ActivatedAutomationRunnerBridge() {
             // Older/self-hosted Den versions reject capabilities they do not
             // know with a 400. Step down one capability set at a time so
             // Automation delivery keeps working until that server upgrades.
-            const capabilitySets: AutomationDesktopRunnerCapability[][] = [
+            const recoveryCapabilities: AutomationDesktopRunnerCapability[] = [
+              AUTOMATION_MODEL_ATTENTION_CAPABILITY,
+              REMOTE_SESSION_DESKTOP_RUNNER_CAPABILITY,
+              REMOTE_SESSION_CONTROL_RUNNER_CAPABILITY,
+              REMOTE_SESSION_RECOVERY_RUNNER_CAPABILITY,
+            ]
+            // Den sends answer requests only to runners that say they take them.
+            const capabilitySets: AutomationDesktopRunnerCapability[][] = deploymentEnabled ? [
+              [...recoveryCapabilities, REMOTE_SESSION_ANSWER_RUNNER_CAPABILITY],
+              recoveryCapabilities,
               [
                 AUTOMATION_MODEL_ATTENTION_CAPABILITY,
                 REMOTE_SESSION_DESKTOP_RUNNER_CAPABILITY,
@@ -94,10 +107,21 @@ function ActivatedAutomationRunnerBridge() {
               ],
               [AUTOMATION_MODEL_ATTENTION_CAPABILITY, REMOTE_SESSION_DESKTOP_RUNNER_CAPABILITY],
               [AUTOMATION_MODEL_ATTENTION_CAPABILITY],
-            ]
+            ] : [[
+              REMOTE_SESSION_DESKTOP_RUNNER_CAPABILITY,
+              REMOTE_SESSION_CONTROL_RUNNER_CAPABILITY,
+              REMOTE_SESSION_RECOVERY_RUNNER_CAPABILITY,
+              REMOTE_SESSION_ONLY_RUNNER_CAPABILITY,
+              REMOTE_SESSION_ANSWER_RUNNER_CAPABILITY,
+            ], [
+              REMOTE_SESSION_DESKTOP_RUNNER_CAPABILITY,
+              REMOTE_SESSION_CONTROL_RUNNER_CAPABILITY,
+              REMOTE_SESSION_RECOVERY_RUNNER_CAPABILITY,
+              REMOTE_SESSION_ONLY_RUNNER_CAPABILITY,
+            ]]
             for (const [index, capabilities] of capabilitySets.entries()) {
               try {
-                return await client.mintAutomationRunnerToken(organizationId, registration(capabilities))
+                return await mintToken(organizationId, registration(capabilities))
               } catch (error) {
                 const last = index === capabilitySets.length - 1
                 if (last || !(error instanceof DenApiError) || error.status !== 400) throw error
@@ -109,6 +133,15 @@ function ActivatedAutomationRunnerBridge() {
           try {
             runner = await mintRunner(runnerId)
           } catch (error) {
+            // An older Den answers 404 for remote session targets when that
+            // organization never had them turned on (or the route predates
+            // them). Nothing to connect: wait for the next refresh quietly
+            // instead of retrying every few seconds.
+            if (!deploymentEnabled && error instanceof DenApiError && error.status === 404) {
+              if (!isCurrent()) return
+              await disconnect()
+              return
+            }
             if (!(error instanceof DenApiError) || error.status !== 409 || error.code !== "automation_runner_identity_conflict") {
               throw error
             }

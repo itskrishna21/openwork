@@ -13,6 +13,7 @@ import {
   resolveDenBaseUrls,
 } from "../../../app/lib/den";
 import { markDesktopSignInInitiated } from "../../../app/lib/den-sign-in-intent";
+import { clearSignInReturnTarget } from "../../../app/lib/den-sign-in-return";
 import { exchangeHandoffAndSignIn } from "../../../app/lib/den-handoff";
 import { parseManualAuthInput } from "../../../app/lib/manual-auth-input";
 import { normalizeOrganizationServerInput } from "../../../app/lib/organization-server-input";
@@ -79,6 +80,7 @@ export function ForcedSigninPage({ developerMode }: ForcedSigninPageProps) {
   const openBrowserAuth = useCallback(
     (mode: "sign-in" | "sign-up") => {
       const url = buildDenAuthUrl(baseUrl, mode);
+      clearSignInReturnTarget();
       markDesktopSignInInitiated();
       setSigninFallbackUrl(url);
       setStatusMessage(
@@ -97,6 +99,7 @@ export function ForcedSigninPage({ developerMode }: ForcedSigninPageProps) {
   );
 
   const exchangeGrant = useCallback(async (grant: string, nextBaseUrl: string) => {
+    clearSignInReturnTarget();
     setAuthBusy(true);
     setAuthError(null);
     setStatusMessage(t("den.signing_in"));
@@ -188,7 +191,10 @@ export function ForcedSigninPage({ developerMode }: ForcedSigninPageProps) {
     void exchangeGrant(grant, baseUrl);
   }, [authBusy, baseUrl, exchangeGrant]);
 
-  const applyBaseUrl = useCallback(async (value?: string) => {
+  const applyBaseUrl = useCallback(async (
+    value?: string,
+    savedMessage = t("den.status_base_url_updated"),
+  ) => {
     const serverOrigin = normalizeOrganizationServerInput(value ?? baseUrlDraft);
     const normalized = serverOrigin ? normalizeDenBaseUrl(serverOrigin) : null;
     if (!normalized) {
@@ -211,7 +217,7 @@ export function ForcedSigninPage({ developerMode }: ForcedSigninPageProps) {
       setBaseUrlDraft(persisted.baseUrl);
       clearDenSession({ includeBaseUrls: false });
       setAuthError(null);
-      setStatusMessage(t("den.status_base_url_updated"));
+      setStatusMessage(savedMessage);
       void desktopConfig.refresh();
       void denAuth.refresh();
       return true;
@@ -293,7 +299,7 @@ export function ForcedSigninPage({ developerMode }: ForcedSigninPageProps) {
       organizationServerError={baseUrlError}
       organizationServerUrl={baseUrl}
       onBaseUrlDraftInput={setBaseUrlDraft}
-      onOrganizationServerSave={applyBaseUrl}
+      onOrganizationServerSave={(url) => applyBaseUrl(url, t("welcome.organization_server_saved"))}
       onResetBaseUrl={() => setBaseUrlDraft(baseUrl)}
       onApplyBaseUrl={() => {
         void applyBaseUrl();

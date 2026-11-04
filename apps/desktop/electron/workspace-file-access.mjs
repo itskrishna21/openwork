@@ -7,6 +7,30 @@ import path from "node:path";
  * @typedef {WorkspaceFileLaunchAllowed | WorkspaceFileLaunchRefused} WorkspaceFileLaunchDecision
  */
 
+/**
+ * Probe a chat file candidate without opening or revealing anything. Launch permissions
+ * are deliberately checked separately by resolveWorkspaceFileLaunch at the final boundary.
+ * @param {string} target
+ * @returns {Promise<string | null>}
+ */
+export async function resolveChatFilePath(target) {
+  // Reject UNC/network and device namespace paths before touching the filesystem.
+  /** @param {string} value */
+  const isLocalAbsolute = (value) => typeof value === "string"
+    && path.isAbsolute(value)
+    && !/^[\\/]{2}/.test(value)
+    && !value.includes("\u0000");
+  if (!isLocalAbsolute(target)) return null;
+  try {
+    const canonical = await realpath(target);
+    if (!isLocalAbsolute(canonical)) return null;
+    const info = await stat(canonical);
+    return info.isFile() || info.isDirectory() ? canonical : null;
+  } catch {
+    return null;
+  }
+}
+
 function describeError(error) {
   if (error instanceof Error && error.message.trim()) return error.message;
   return String(error ?? "unknown error");
@@ -75,4 +99,36 @@ export async function resolveWorkspaceFileLaunch(workspaceRoot, target, deps = {
   }
 
   return { ok: true, path: resolvedTarget };
+}
+
+/**
+ * A missing chat reference is normal (another computer, deleted output), not
+ * an OS error. Check the exact item before opening OR revealing; never open a
+ * parent directory as a substitute for a missing file. Symlink launch guards
+ * still run at the final native boundary.
+ * @param {string} workspaceRoot
+ * @param {string} target
+ * @param {{ reveal?: boolean; openPath: (path: string) => Promise<string>; revealPath: (path: string) => void }} actions
+ * @returns {Promise<import("@openwork/types/desktop-ipc").DesktopWorkspaceFileOpenResult>}
+ */
+export async function openChatWorkspaceFile(workspaceRoot, target, actions) {
+  const decision = await resolveWorkspaceFileLaunch(workspaceRoot, target);
+  if (decision.ok === false) {
+    if (decision.reason === "outside") {
+      try {
+        await stat(target);
+        actions.revealPath(target);
+        return { ok: true, action: "revealed" };
+      } catch {
+        // The reference is stale, or this account cannot access it.
+      }
+    }
+    return { ok: true, action: "unavailable" };
+  }
+  if (actions.reveal) {
+    actions.revealPath(decision.path);
+    return { ok: true, action: "revealed" };
+  }
+  const error = await actions.openPath(decision.path);
+  return error?.trim() ? { ok: false, error } : { ok: true, action: "opened" };
 }

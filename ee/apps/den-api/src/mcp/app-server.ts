@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto"
 import { startMcpAppTiming } from "@openwork/types/mcp-app-timing";
 import { EXTENSION_ID, RESOURCE_MIME_TYPE } from "@modelcontextprotocol/ext-apps/server"
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js"
@@ -17,6 +18,7 @@ import { and, eq, isNull } from "@openwork-ee/den-db/drizzle"
 import { ConfigObjectTable, MemberTable, OrganizationTable } from "@openwork-ee/den-db/schema"
 import { normalizeDenTypeId } from "@openwork-ee/utils/typeid"
 import {
+  MCP_APP_INITIAL_RESULTS_META,
   MCP_APP_LAUNCH_TOOL_NAME,
   mcpAppIdSchema,
   parseMcpAppResourceUri,
@@ -24,10 +26,10 @@ import {
 } from "@openwork/types/mcp-app"
 import type { Context, Hono } from "hono"
 import { resolvePublicOrigin } from "../capability-sources/generic-oauth.js"
+import { cache } from "../cache.js"
 import { db } from "../db.js"
 import { env } from "../env.js"
 import { getOrganizationFeatures } from "../features.js"
-import { appMcpServersEnabled } from "../mcp-app-rollout.js"
 import {
   loadMcpAppResource,
   loadMcpAppServerDefinition,
@@ -36,12 +38,15 @@ import {
   type McpAppServerDefinition,
 } from "../mcp-apps.js"
 import { executeCapabilityWithBudget } from "./agent.js"
-import { callMcpAppTool } from "./app-tools.js"
-import type { McpPrincipal } from "./auth.js"
+import { runsWithoutClick } from "./app-tool-access.js"
+import { launchInitialResults, launchReadHandoff, requiredScope, type LaunchReadHandoff, type McpAppLaunchDataStore } from "./app-launch-data.js"
+import { callMcpAppTool, mcpAppToolKeepable } from "./app-tools.js"
+import { mcpAuditPrincipal } from "../audit/mcp-service-audit.js"
+import { mcpPrincipalCredentialId, type McpPrincipal } from "./auth.js"
 import { createCapabilityRegistryContext, type ExecuteCapabilityToolResult } from "./capability-registry.js"
 import { resolveMcpMemberIdentity } from "./external-capabilities.js"
 import { getCatalog } from "./index.js"
-import { DEN_MCP_READ_SCOPE, DEN_MCP_WRITE_SCOPE } from "./scopes.js"
+import { DEN_MCP_READ_SCOPE } from "./scopes.js"
 
 /** App servers share the connection endpoint path; their ids are App config objects. */
 export function isMcpAppServerId(value: string): boolean {
@@ -54,7 +59,11 @@ const launchInputSchema: Tool["inputSchema"] = {
     input: {
       type: "object",
       additionalProperties: true,
-      description: "Optional JSON launch input the App receives. Opening runs no other tools.",
+      description: "Optional JSON launch input the App receives.",
+    },
+    timeZone: {
+      type: "string",
+      description: "Optional IANA time zone for the data the App loads as it opens.",
     },
   },
   additionalProperties: false,
@@ -72,36 +81,28 @@ function launchTool(definition: McpAppServerDefinition): Tool {
   return {
     name: MCP_APP_LAUNCH_TOOL_NAME,
     title: `Open ${app.title}`,
-    description: `Open ${app.title}.${app.description ? ` ${app.description}` : ""} Returns its launch input and a readable summary; opening runs no other tools.`,
+    description: `Open ${app.title}.${app.description ? ` ${app.description}` : ""} Returns its launch input and a readable summary${definition.loadsWithLaunch ? "; opening also loads the App's read-only data" : "; opening runs no other tools"}.`,
     inputSchema: launchInputSchema,
     annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
     _meta: { ui: { resourceUri: app.resourceUri, visibility: ["model", "app"] }, "ui/resourceUri": app.resourceUri },
   }
 }
 
-/**
- * Read-only tools, including connection tools their provider marks read-only,
- * advertise it so hosts can run them without a click. Den checks a connection
- * tool's label again on every call.
- */
+/** Den checks a connection tool's labels again on every call. */
 function boundTool(binding: McpAppToolBinding): Tool {
+  const noClick = runsWithoutClick(binding)
   return {
     name: binding.name,
     description: binding.description,
     inputSchema: { ...binding.inputSchema, type: "object" },
     annotations: {
-      readOnlyHint: binding.readOnly,
-      destructiveHint: !binding.readOnly,
+      readOnlyHint: noClick,
+      destructiveHint: !noClick,
       idempotentHint: binding.readOnly,
       openWorldHint: binding.kind !== "api",
     },
     _meta: { ui: { visibility: ["model", "app"] } },
   }
-}
-
-/** A connection tool always needs mcp:write, whatever its label, because external dispatch requires it. */
-function requiredScope(binding: McpAppToolBinding): string {
-  return binding.readOnly && binding.kind !== "mcp" ? DEN_MCP_READ_SCOPE : DEN_MCP_WRITE_SCOPE
 }
 
 type AppRefusal = "not_a_member" | "other_organization" | "apps_off" | "not_found"
@@ -171,6 +172,11 @@ export function createMcpAppServer(input: {
   scopes: ReadonlySet<string>
   loadResource: (revision: { appId: string; revisionId: string }) => Promise<McpAppResource>
   callTool: (binding: McpAppToolBinding, args: Record<string, unknown>) => Promise<ExecuteCapabilityToolResult>
+  launchData?: McpAppLaunchDataStore
+  /** Whether a read's result may be kept for this caller's next open. */
+  canKeep?: (binding: McpAppToolBinding) => boolean
+  /** Where a launch read past its budget waits for this caller's own call. */
+  launchReads?: LaunchReadHandoff
 }) {
   const { app, tools } = input.definition
   const server = new McpServer({ name: app.title, version: "1.0.0" }, {
@@ -189,16 +195,30 @@ export function createMcpAppServer(input: {
     const args = toolArguments(request.params.arguments)
     if (request.params.name === MCP_APP_LAUNCH_TOOL_NAME) {
       if (!input.scopes.has(DEN_MCP_READ_SCOPE)) return scopeError(MCP_APP_LAUNCH_TOOL_NAME, DEN_MCP_READ_SCOPE)
+      const launchInput = toolArguments(args.input)
+      // Launch input can change what the App asks for, so only an App opened
+      // without any gets reads made ahead of it. They stay out of the model's
+      // view in _meta, which hosts pass to the App with the result.
+      const initialResults = input.definition.loadsWithLaunch && Object.keys(launchInput).length === 0
+        ? await launchInitialResults({ tools, scopes: input.scopes, timeZone: typeof args.timeZone === "string" ? args.timeZone : undefined, callTool: input.callTool, store: input.launchData, canKeep: input.canKeep, handoff: input.launchReads })
+        : []
       return {
         content: [{ type: "text", text: app.textFallback }],
-        structuredContent: { app, input: toolArguments(args.input) },
+        structuredContent: { app, input: launchInput },
+        ...(initialResults.length > 0 ? { _meta: { [MCP_APP_INITIAL_RESULTS_META]: initialResults } } : {}),
       }
     }
     const binding = tools.find((tool) => tool.name === request.params.name)
     if (!binding) throw new McpError(ErrorCode.InvalidParams, `Tool ${request.params.name} is not available on ${app.title}.`)
+    // OpenWork's host answers a cached read from its own storage. One that
+    // reaches this server came from another host and must not run the tool.
+    if (request.params._meta?.["openwork/cache"] === "read") {
+      return { isError: true, content: [{ type: "text", text: "No kept result is available from this host." }], _meta: { "openwork/cached": false } }
+    }
     const scope = requiredScope(binding)
     if (!input.scopes.has(scope)) return scopeError(binding.name, scope)
-    return input.callTool(binding, args)
+    const run = () => input.callTool(binding, args)
+    return input.launchReads ? input.launchReads.call(binding, args, run) : run()
   })
 
   server.server.setRequestHandler(ListResourcesRequestSchema, async () => ({
@@ -250,14 +270,13 @@ async function handleMcpAppServerRequestUntimed(input: {
   const [member, home, organizationFeatures, catalog] = await Promise.all([
     resolveMcpMemberIdentity({ userId: principal.userId, organizationId }),
     appOrganizationForMember(input.appId, principal.userId),
-    getOrganizationFeatures(organizationId),
+    getOrganizationFeatures(organizationId, { userId: principal.userId }),
     getCatalog(input.app, context.env),
   ])
   if (!member) return refuse("not_a_member")
   // A client authorized for one organization cannot reach an App built in another.
   if (home && home.id !== organizationId) return refuse("other_organization", home.name)
-  // Building your own Apps is per-organization and default-off.
-  if (!appMcpServersEnabled(organizationFeatures)) return refuse("apps_off")
+  if (!env.appMcpServersEnabled) return refuse("apps_off")
   const capabilityContext = createCapabilityRegistryContext({
     app: input.app,
     env: context.env,
@@ -268,8 +287,10 @@ async function handleMcpAppServerRequestUntimed(input: {
     redirectUriBase: resolvePublicOrigin(context.req.raw, env.apiPublicUrl),
     generatedArtifactViewsEnabled: env.generatedArtifactViewsEnabled,
     organizationFeatures,
+    audit: mcpAuditPrincipal({ organizationId, userId: principal.userId, memberId: member.orgMembershipId, credentialId: mcpPrincipalCredentialId(principal) }),
+    usageSource: "app",
   })
-  const access = { organizationId, member, enabled: capabilityContext.externalMcpConnectionsEnabled, requestScope: {} }
+  const access = { organizationId, member, requestScope: {} }
   let definition: McpAppServerDefinition
   try {
     definition = await loadMcpAppServerDefinition({ ...access, appId: input.appId })
@@ -285,6 +306,29 @@ async function handleMcpAppServerRequestUntimed(input: {
       capability: binding.capability,
       invoke: () => callMcpAppTool(capabilityContext, binding, args),
     }),
+    canKeep: (binding) => mcpAppToolKeepable(capabilityContext, binding),
+    // The launch and the App's later call arrive as separate requests, so a
+    // read is matched to its caller by everything that shapes its result.
+    launchReads: launchReadHandoff(JSON.stringify([
+      organizationId, member.orgMembershipId, [...member.teamIds].sort(), mcpPrincipalCredentialId(principal),
+      [...principal.scopes].sort(), definition.app.appId, definition.app.revisionId,
+    ])),
+    launchData: {
+      // The inventory revision limits stale hits; launchInitialResults still
+      // runs every read through current authorization before accepting a hit.
+      async open(timeZone) {
+        const revision = await cache.inventory.revision(organizationId)
+        if (!revision) return null
+        const key = createHash("sha256").update(JSON.stringify([
+          revision, member.orgMembershipId, [...member.teamIds].sort(), definition.app.appId, definition.app.revisionId,
+          [...principal.scopes].sort(), timeZone ?? "",
+        ])).digest("hex")
+        return {
+          kept: await cache.mcpAppLaunchData.load(key),
+          save: (results) => cache.mcpAppLaunchData.save(key, results),
+        }
+      },
+    },
   })
   const transport = new StreamableHTTPTransport()
   await server.connect(transport)

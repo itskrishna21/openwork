@@ -62,6 +62,38 @@ export const INFERENCE_WINDOW_DURATIONS_MS: Record<
   monthly: 30 * 24 * 60 * 60 * 1000,
 } as const;
 
+export function isInferenceWindowType(value: unknown): value is InferenceWindowType {
+  return typeof value === "string" && INFERENCE_WINDOW_TYPES.some((windowType) => windowType === value);
+}
+
+/**
+ * The organization used its OpenWork Models allowance for one window. It lasts until that window resets, so it is
+ * not a rate limit and clients must not retry it: the gateway answers 429 with these markers, `retry-after` and
+ * `x-should-retry: false`. The body never names the organization and holds no digits, because engines retry any
+ * error whose text mentions a 5xx/429 status or a rate limit.
+ */
+export const OPENWORK_MODELS_ALLOWANCE_ERROR_CODE = "openwork_models_allowance_reached";
+export const OPENWORK_MODELS_ALLOWANCE_SOURCE = "openwork_models";
+export const OPENWORK_MODELS_ALLOWANCE_MESSAGE = "Your workspace used its OpenWork Models allowance.";
+
+export function openWorkModelsAllowanceErrorBody() {
+  return {
+    error: {
+      message: OPENWORK_MODELS_ALLOWANCE_MESSAGE,
+      type: "usage_limit_error",
+      param: null,
+      code: OPENWORK_MODELS_ALLOWANCE_ERROR_CODE,
+      source: OPENWORK_MODELS_ALLOWANCE_SOURCE,
+    },
+  } as const;
+}
+
+export function hasOpenWorkModelsAllowanceHttpMarker(response: Pick<Response, "status" | "headers">): boolean {
+  return response.status === 429
+    && response.headers.get("X-OpenWork-Error-Code") === OPENWORK_MODELS_ALLOWANCE_ERROR_CODE
+    && response.headers.get("X-OpenWork-Usage-State") === "blocked";
+}
+
 // For upstreamModel values, please get from models.dev/api.json provider = openrouter.models.id
 
 export const INFERENCE_MODEL_ALIASES = {
@@ -116,6 +148,31 @@ export const INFERENCE_MODEL_ALIASES = {
   "moonshotai/kimi-k3": {
     upstreamModel: "moonshotai/kimi-k3",
     displayName: "OpenWork: Kimi K3",
+    enabled: true,
+    usageFactor: 1,
+  },
+  // The model behind free Auto, on the organization's own usage.
+  "openai/gpt-6-luna": {
+    upstreamModel: "openai/gpt-6-luna",
+    displayName: "OpenWork: GPT-6 Luna",
+    enabled: true,
+    usageFactor: 1,
+  },
+  "moonshotai/kimi-k3.1-pro": {
+    upstreamModel: "moonshotai/kimi-k3.1-pro",
+    displayName: "OpenWork: Kimi K3.1 Pro",
+    enabled: true,
+    usageFactor: 1,
+  },
+  "deepseek/deepseek-v4.1-flash": {
+    upstreamModel: "deepseek/deepseek-v4.1-flash",
+    displayName: "OpenWork: DeepSeek V4.1 Flash",
+    enabled: true,
+    usageFactor: 1,
+  },
+  "openai/gpt-6.1-terra": {
+    upstreamModel: "openai/gpt-6.1-terra",
+    displayName: "OpenWork: GPT-6.1 Terra",
     enabled: true,
     usageFactor: 1,
   },
@@ -228,8 +285,8 @@ export function withFreeInferenceDefaultPinned(metadata: Record<string, unknown>
 }
 
 export function managedModelCatalog(): ManagedModelRecommendation[] {
-  return [{ modelID: INFERENCE_FREE_MODEL_ID, displayName: "Auto", providerName: "OpenWork",
-    summary: "Free automatic model", recommended: true, rank: 1, capabilities: ["tools"] }];
+  return [{ modelID: INFERENCE_FREE_MODEL_ID, displayName: "OpenWork Free", providerName: "OpenWork",
+    summary: "Free model with a usage limit", recommended: true, rank: 1, capabilities: ["tools"] }];
 }
 
 /**
@@ -293,6 +350,7 @@ export const INFERENCE_PROVIDER_CREDENTIAL_KINDS = [
   "gcp_service_account",
   "oauth_google",
   "oauth_azure",
+  "aws_sso",
 ] as const;
 export type InferenceProviderCredentialKind =
   (typeof INFERENCE_PROVIDER_CREDENTIAL_KINDS)[number];
@@ -361,6 +419,11 @@ export type InferenceGcpServiceAccountSecret = z.infer<
   typeof inferenceGcpServiceAccountSecretSchema
 >;
 
+const authorizationRevisionSchema = z.string().regex(/^[A-Za-z0-9_-]{43}$/);
+
+/** A Microsoft Entra ID directory (tenant) ID. Only the GUID form: the token issuer names it. */
+export const microsoftTenantIdSchema = z.string().regex(/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i);
+
 export const inferenceOauthTokenSecretSchema = z.object({
   accessToken: z.string().min(1),
   refreshToken: z.string().min(1).optional(),
@@ -370,14 +433,103 @@ export const inferenceOauthTokenSecretSchema = z.object({
     email: z.email(),
     emailVerified: z.literal(true),
     clientId: z.string().min(1),
-    authorizationRevision: z.string().regex(/^[A-Za-z0-9_-]{43}$/).optional(),
+    authorizationRevision: authorizationRevisionSchema.optional(),
+  }).optional(),
+  /** Member Entra ID sign-in (Microsoft Foundry). The tenant and client the refresh token belongs to. */
+  microsoftIdentity: z.object({
+    tenantId: microsoftTenantIdSchema,
+    objectId: z.string().min(1).max(255),
+    /** preferred_username or email from the ID token; display only, never an authorization input. */
+    userName: z.string().min(1).max(320).nullable(),
+    clientId: z.string().min(1),
+    authorizationRevision: authorizationRevisionSchema,
   }).optional(),
 });
 export type InferenceOauthTokenSecret = z.infer<typeof inferenceOauthTokenSecretSchema>;
 
+/** AWS account IDs are 12 digits. */
+export const awsAccountIdSchema = z.string().regex(/^\d{12}$/);
+/** IAM Identity Center permission-set names: 1-32 characters from [\w+=,.@-]. */
+export const awsPermissionSetNameSchema = z.string().regex(/^[\w+=,.@-]{1,32}$/);
+/**
+ * The AWS access portal URL, e.g. https://d-xxxxxxxxxx.awsapps.com/start, a custom
+ * awsapps.com subdomain, or an account instance's https://ssoins-….portal.<region>.app.aws.
+ * It is only ever sent to IAM Identity Center, never fetched.
+ */
+export const awsSsoStartUrlSchema = z.string().max(2048).refine((value) => {
+  try {
+    const url = new URL(value);
+    return url.protocol === "https:" && !url.username && !url.password && !url.search && !url.hash && !url.port
+      && /^[a-z0-9-]+(?:\.[a-z0-9-]+)*\.(?:awsapps\.com|app\.aws)$/i.test(url.hostname);
+  } catch { return false; }
+}, { message: "Use the AWS access portal URL, for example https://d-xxxxxxxxxx.awsapps.com/start." });
+const awsRegionSchema = z.string().max(32).regex(/^[a-z]{2}(?:-[a-z]+)+-\d{1,2}$/);
+
+/**
+ * Non-secret IAM Identity Center settings of a member credential set: everyone
+ * who signs in through the set gets credentials for this account and permission set.
+ */
+export const gatewayAwsSsoSettingsSchema = z.object({
+  startUrl: awsSsoStartUrlSchema,
+  /** IAM Identity Center home region, which can differ from the Bedrock region. */
+  region: awsRegionSchema,
+  accountId: awsAccountIdSchema,
+  roleName: awsPermissionSetNameSchema,
+}).strict();
+export type GatewayAwsSsoSettings = z.infer<typeof gatewayAwsSsoSettingsSchema>;
+
+/**
+ * Member IAM Identity Center sign-in (Amazon Bedrock). The token, the OIDC client
+ * it was issued to, and the account and permission set it was approved for.
+ */
+export const inferenceAwsSsoSecretSchema = z.object({
+  accessToken: z.string().min(1).max(16_384),
+  refreshToken: z.string().min(1).max(16_384),
+  clientId: z.string().min(1).max(4096),
+  clientSecret: z.string().min(1).max(16_384),
+  /** Epoch seconds after which the registered OIDC client, and its refresh token, stop working. */
+  clientSecretExpiresAt: z.number().int().positive(),
+  sso: gatewayAwsSsoSettingsSchema,
+  identity: z.object({
+    /** The assumed-role ARN from STS GetCallerIdentity at sign-in. */
+    arn: z.string().min(1).max(2048),
+    /** The role session name, normally the person's Identity Center user name. Display only. */
+    userName: z.string().min(1).max(320).nullable(),
+    authorizationRevision: authorizationRevisionSchema,
+  }),
+});
+export type InferenceAwsSsoSecret = z.infer<typeof inferenceAwsSsoSecretSchema>;
+
+/** Synthetic catalog provider for Claude on Microsoft Foundry (the Anthropic API on `<resource>.services.ai.azure.com`). */
+export const MICROSOFT_FOUNDRY_PROVIDER_ID = "microsoft-foundry";
+
+/** How a person signs in to a Gateway provider in a member credential set. */
+export const GATEWAY_MEMBER_SIGN_IN_METHODS = ["google", "aws_sso", "microsoft"] as const;
+export type GatewayMemberSignInMethod = (typeof GATEWAY_MEMBER_SIGN_IN_METHODS)[number];
+
+/** The member credential kind each sign-in method stores. */
+export const GATEWAY_MEMBER_SIGN_IN_CREDENTIAL_KINDS = {
+  google: "oauth_google",
+  aws_sso: "aws_sso",
+  microsoft: "oauth_azure",
+} as const satisfies Record<GatewayMemberSignInMethod, InferenceProviderCredentialKind>;
+
+/**
+ * The sign-in a provider supports for member credential sets, or null when
+ * members cannot sign in (LiteLLM has its own per-person keys).
+ */
+export function gatewayMemberSignInMethod(providerId: string): GatewayMemberSignInMethod | null {
+  if (providerId === "google-vertex" || providerId === "google-vertex-anthropic") return "google";
+  if (providerId === "amazon-bedrock" || providerId === "amazon-bedrock-mantle") return "aws_sso";
+  if (providerId === MICROSOFT_FOUNDRY_PROVIDER_ID) return "microsoft";
+  return null;
+}
+
 export const gatewayMemberConnectionsResponseSchema = z.object({
   connections: z.array(z.object({
     providerId: z.string(),
+    /** Older Den responses omit it; they only offered Google sign-in. */
+    signInMethod: z.enum(GATEWAY_MEMBER_SIGN_IN_METHODS).default("google"),
     credentialSetId: z.string(),
     providerName: z.string(),
     name: z.string(),
@@ -397,7 +549,8 @@ export type InferenceProviderSecret =
   | { kind: "aws_keys"; awsKeys: InferenceAwsKeysSecret }
   | { kind: "gcp_service_account"; serviceAccount: InferenceGcpServiceAccountSecret }
   | { kind: "oauth_google"; token: InferenceOauthTokenSecret }
-  | { kind: "oauth_azure"; token: InferenceOauthTokenSecret };
+  | { kind: "oauth_azure"; token: InferenceOauthTokenSecret }
+  | { kind: "aws_sso"; awsSso: InferenceAwsSsoSecret };
 
 function parseJsonSecret(raw: string): unknown {
   try {
@@ -430,5 +583,7 @@ export function parseInferenceProviderSecret(
     case "oauth_google":
     case "oauth_azure":
       return { kind, token: inferenceOauthTokenSecretSchema.parse(parseJsonSecret(raw)) };
+    case "aws_sso":
+      return { kind, awsSso: inferenceAwsSsoSecretSchema.parse(parseJsonSecret(raw)) };
   }
 }

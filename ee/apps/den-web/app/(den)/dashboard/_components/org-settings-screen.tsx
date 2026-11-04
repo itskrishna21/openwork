@@ -7,6 +7,9 @@ import {
   getAllowedDesktopVersionsFromMetadata,
   getOrgAccessFlags,
   getRequireSsoFromMetadata,
+  getRestrictDomainToSsoFromMetadata,
+  orgFeatureEnabled,
+  permissionLockReason,
 } from "../../_lib/den-org";
 import { DashboardPageTemplate } from "../../_components/ui/dashboard-page-template";
 import { DenButton } from "../../_components/ui/button";
@@ -17,6 +20,9 @@ import { DenNotice } from "../../_components/ui/notice";
 import { useOrgDashboard } from "../_providers/org-dashboard-provider";
 import { EnterprisePlanNotice } from "./enterprise-plan-notice";
 import { OrgWebOriginsSection } from "./org-web-origins-section";
+import { OrgDefaultModelSection } from "./default-model-section";
+import { OrgAutomationSettingsSection } from "./org-automation-settings-section";
+import { SettingsToggle } from "./settings-toggle";
 import {
   allPublishedDesktopVersionsAllowed,
   compareDesktopVersions,
@@ -47,44 +53,6 @@ function toggleAllowedDesktopVersion(
   }
 
   return current.filter((entry) => entry !== version);
-}
-
-function SettingsToggle({
-  label,
-  checked,
-  disabled,
-  onChange,
-}: {
-  label: string;
-  checked: boolean;
-  disabled?: boolean;
-  onChange: (nextValue: boolean) => void;
-}) {
-  return (
-    <button
-      type="button"
-      role="switch"
-      aria-checked={checked}
-      aria-label={label}
-      disabled={disabled}
-      onClick={() => onChange(!checked)}
-      className={[
-        "relative inline-flex h-7 w-12 items-center rounded-full border transition-colors",
-        checked
-          ? "border-[#0f172a] bg-[#0f172a]"
-          : "border-gray-200 bg-gray-200",
-        disabled ? "cursor-not-allowed opacity-60" : "cursor-pointer",
-      ].join(" ")}
-    >
-      <span
-        aria-hidden="true"
-        className={[
-          "inline-block h-5 w-5 rounded-full bg-white transition-transform",
-          checked ? "translate-x-6" : "translate-x-1",
-        ].join(" ")}
-      />
-    </button>
-  );
 }
 
 function DeleteOrganizationDialog({
@@ -205,6 +173,7 @@ export function OrgSettingsScreen() {
   const [domainRestrictionsEnabled, setDomainRestrictionsEnabled] =
     useState(false);
   const [requireSsoEnabled, setRequireSsoEnabled] = useState(false);
+  const [restrictDomainToSsoEnabled, setRestrictDomainToSsoEnabled] = useState(false);
   const [domainEditModeEnabled, setDomainEditModeEnabled] = useState(false);
   const [desktopVersionOptions, setDesktopVersionOptions] = useState<string[]>(
     [],
@@ -232,9 +201,11 @@ export function OrgSettingsScreen() {
   const access = getOrgAccessFlags(
     orgContext?.currentMember.role ?? "member",
     orgContext?.currentMember.isOwner ?? false,
-    orgContext?.roles,
+    orgContext?.currentMember.permissions,
   );
   const canManageSettings = access.canManageSettings;
+  // admins choose the model new desktop chats start with.
+
   const canManageDesktopVersions = access.canManageSettings;
   const canDeleteOrganization = access.canDeleteOrganization;
   const draftAllowedDomains = useMemo(
@@ -292,6 +263,7 @@ export function OrgSettingsScreen() {
       (orgContext.organization.allowedEmailDomains?.length ?? 0) > 0,
     );
     setRequireSsoEnabled(getRequireSsoFromMetadata(orgContext.organization.metadata));
+    setRestrictDomainToSsoEnabled(getRestrictDomainToSsoFromMetadata(orgContext.organization.metadata));
     setDomainEditModeEnabled(false);
   }, [orgContext]);
 
@@ -406,6 +378,7 @@ export function OrgSettingsScreen() {
 
   const organizationId = orgContext.organization.id;
   const organizationName = orgContext.organization.name;
+  const ssoPerOrganization = orgFeatureEnabled(orgContext, "ssoPerOrganization");
 
   async function handleCopyOrgId() {
     await navigator.clipboard.writeText(organizationId);
@@ -433,7 +406,7 @@ export function OrgSettingsScreen() {
     clearOrgSettingsCompletion();
 
     if (!canManageSettings) {
-      setPageError("Only workspace owners and super-admins can change settings.");
+      setPageError("You don't have permission to change settings.");
       return;
     }
 
@@ -444,6 +417,7 @@ export function OrgSettingsScreen() {
           ? draftAllowedDomains
           : null,
         requireSso: requireSsoEnabled,
+        ...(ssoPerOrganization ? { restrictDomainToSso: restrictDomainToSsoEnabled } : {}),
         ...(supportedDesktopVersionOptions.length > 0
           ? {
               allowedDesktopVersions: allDesktopVersionsAllowed
@@ -518,7 +492,6 @@ export function OrgSettingsScreen() {
           ) : null}
         </span>
       )}
-      colors={["#D9F99D", "#0F172A", "#0F766E", "#FDE68A"]}
     >
       {orgContext && !orgContext.entitlements.orgControls ? (
         <EnterprisePlanNotice feature="Enforced SSO and desktop version control" />
@@ -676,25 +649,62 @@ export function OrgSettingsScreen() {
               Single sign-on requirement
             </h2>
             <p className="text-[14px] text-gray-500">
-              Require members to use the workspace SSO entrypoint when their email domain matches this organization.
+              {ssoPerOrganization
+                ? "SSO is offered first at sign-in. Choose whether this organization, or your whole email domain, requires it."
+                : "Require members to use the workspace SSO entrypoint when their email domain matches this organization."}
             </p>
           </div>
 
-          <div className="flex items-start justify-between gap-4 rounded-[24px] border border-gray-200 bg-white px-5 py-4">
-            <div className="grid gap-1 pr-4">
-              <p className="text-[15px] font-medium text-gray-900">Require SSO for matching domains</p>
-              <p className="text-[13px] text-gray-500">
-                Email/password sign-in will redirect users to the org SSO flow when their email domain matches the configured SSO connection.
-              </p>
+          {ssoPerOrganization ? (
+            <>
+              <div className="flex items-start justify-between gap-4 rounded-[24px] border border-gray-200 bg-white px-5 py-4" data-testid="require-sso-row">
+                <div className="grid gap-1 pr-4">
+                  <p className="text-[15px] font-medium text-gray-900">Require SSO</p>
+                  <p className="text-[13px] text-gray-500">
+                    Members open this organization only after signing in with its SSO. They can still use their password or Google for other organizations.
+                  </p>
+                </div>
+                <SettingsToggle
+                  label="Require SSO for this organization"
+                  checked={requireSsoEnabled}
+                  disabled={!canManageSettings}
+                  onChange={setRequireSsoEnabled}
+                />
+              </div>
+              <div className="flex items-start justify-between gap-4 rounded-[24px] border border-gray-200 bg-white px-5 py-4" data-testid="restrict-domain-sso-row">
+                <div className="grid gap-1 pr-4">
+                  <p className="text-[15px] font-medium text-gray-900">Restrict this domain to our SSO</p>
+                  <p className="text-[13px] text-gray-500">
+                    Everyone with an email on your verified SSO domain must sign in with this organization's SSO, including people invited to other organizations.
+                  </p>
+                </div>
+                <SettingsToggle
+                  label="Restrict this domain to our SSO"
+                  checked={restrictDomainToSsoEnabled}
+                  disabled={!canManageSettings}
+                  onChange={setRestrictDomainToSsoEnabled}
+                />
+              </div>
+            </>
+          ) : (
+            <div className="flex items-start justify-between gap-4 rounded-[24px] border border-gray-200 bg-white px-5 py-4">
+              <div className="grid gap-1 pr-4">
+                <p className="text-[15px] font-medium text-gray-900">Require SSO for matching domains</p>
+                <p className="text-[13px] text-gray-500">
+                  Email/password sign-in will redirect users to the org SSO flow when their email domain matches the configured SSO connection.
+                </p>
+              </div>
+              <SettingsToggle
+                label="Require SSO for this organization"
+                checked={requireSsoEnabled}
+                disabled={!canManageSettings}
+                onChange={setRequireSsoEnabled}
+              />
             </div>
-            <SettingsToggle
-              label="Require SSO for this organization"
-              checked={requireSsoEnabled}
-              disabled={!canManageSettings}
-              onChange={setRequireSsoEnabled}
-            />
-          </div>
+          )}
         </DenCard>
+
+        <OrgAutomationSettingsSection canManage={canManageSettings} />
 
         <DenCard size="spacious" className="grid gap-6">
           <div className="grid gap-2">
@@ -800,7 +810,7 @@ export function OrgSettingsScreen() {
 
         <div className="flex min-w-0 flex-wrap items-center justify-between gap-3">
           <p className="text-[13px] text-gray-500">
-            {!canManageSettings ? "Admins can view settings here. Owners and super-admins can change them." : null}
+            {!canManageSettings ? `Read only. ${permissionLockReason("organization.update")}` : null}
           </p>
           <DenButton
             type="submit"
@@ -812,8 +822,12 @@ export function OrgSettingsScreen() {
         </div>
       </form>
 
-      {access.canViewSettings ? (
-        <OrgWebOriginsSection orgId={organizationId} canManage={canManageSettings} />
+      {access.canViewModelsSettings ? (
+        <OrgDefaultModelSection canManage={access.canManageModelsSettings} />
+      ) : null}
+
+      {access.canViewWebOrigins ? (
+        <OrgWebOriginsSection orgId={organizationId} canManage={access.canManageWebOrigins} />
       ) : null}
 
       {canDeleteOrganization ? (
