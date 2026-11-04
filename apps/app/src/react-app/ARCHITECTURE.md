@@ -83,6 +83,11 @@ src/index.react.tsx                       React entry
   kernel, shell, and connections.
 - Feature state tightly coupled to one domain lives inside that domain
   (`domains/session/sync/`, `domains/settings/state/`).
+- Engine lifecycle and history conversion belong to the OpenWork host and
+  upstream engine, not the renderer. `shell/use-engine-routing.ts` refreshes
+  routing after a host-owned engine switch without migration progress,
+  consent, or actions. `shell/engine-switch.tsx` keeps activity confirmations
+  for manual engine switches. Legacy Den policy values cannot revert the host.
 
 ## Active workspace and session
 

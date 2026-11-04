@@ -43,6 +43,11 @@ export interface HeadlessThreadMessagePart {
   toolOutput?: string;
   /** The tool call's error text, when it failed. */
   toolError?: string;
+  /** The engine's short title for a tool call, e.g. a command's description. */
+  toolTitle?: string;
+  /** When the part started and ended, epoch ms, when the engine records it. */
+  startedAt?: number;
+  endedAt?: number;
   synthetic?: boolean;
   ignored?: boolean;
 }
@@ -53,6 +58,8 @@ export interface HeadlessThreadMessage {
   /** The user message this assistant response belongs to. */
   parentId: string | null;
   createdAt: number | null;
+  /** When an assistant message finished, when the engine records it. */
+  completedAt?: number | null;
   error: HeadlessThreadMessageError | null;
   usage: HeadlessThreadUsage | null;
   parts: HeadlessThreadMessagePart[];
@@ -75,6 +82,10 @@ export interface HeadlessThreadUsage {
 
 export interface CreateThreadInput {
   title: string;
+  /** Native V2 creation identity. V1 rejects this before creating a session. */
+  id?: string;
+  /** Native V2 metadata, verified on the creation receipt before any prompt. */
+  metadata?: Record<string, unknown>;
   /** Optional first turn. When present the thread starts running immediately. */
   prompt?: string;
   model?: HeadlessThreadModel;
@@ -102,7 +113,7 @@ export interface HeadlessThread {
 export interface HeadlessThreadTurnInput {
   prompt: string;
   model?: HeadlessThreadModel;
-  /** Stable engine message id used to make prompt admission idempotent. */
+  /** Stable message identity. V2 deduplicates admission atomically; V1 only checks history before submitting. */
   messageId?: string;
   signal?: AbortSignal;
 }
@@ -166,13 +177,35 @@ export interface HeadlessTranscriptToolCall {
   status: string | null;
 }
 
+/** One step of a message, in the order the engine recorded it. */
+export type HeadlessTranscriptPart =
+  | { type: "text"; text: string }
+  | { type: "reasoning"; text: string; durationMs: number | null }
+  | {
+    type: "tool";
+    partId: string;
+    name: string;
+    callId: string | null;
+    status: string | null;
+    title: string | null;
+    /** As the engine recorded them; callers bound what they pass on. */
+    input: unknown;
+    output: string | null;
+    error: string | null;
+    startedAt: number | null;
+    endedAt: number | null;
+  };
+
 export interface HeadlessTranscriptMessage {
   id: string;
   role: string;
   createdAt: number | null;
+  completedAt: number | null;
   text: string;
   reasoning: string;
   toolCalls: HeadlessTranscriptToolCall[];
+  /** Text, reasoning and tool steps in order. */
+  parts: HeadlessTranscriptPart[];
 }
 
 export interface HeadlessThreadTranscript {
@@ -193,7 +226,43 @@ export interface AgentSessionClient {
   abortThread(threadId: string, input?: { signal?: AbortSignal }): Promise<HeadlessAbortResult>;
 }
 
+/** What a running thread waits on the person for, if anything. */
+export type HeadlessThreadWaitingFor = "permission" | "question" | null;
+
+/** One question of a pending request, as plain text. */
+export interface HeadlessThreadPendingQuestion {
+  header: string;
+  question: string;
+  options: Array<{ label: string; description: string }>;
+  multiple: boolean;
+  custom: boolean;
+}
+
+/** The question or permission a thread waits on, in words the person decides on. */
+export type HeadlessThreadPending =
+  | { kind: "question"; requestId: string; questions: HeadlessThreadPendingQuestion[] }
+  | { kind: "permission"; requestId: string; title: string; detail: string; command?: string };
+
+/** The person's answer; a remote surface never approves "always". */
+export type HeadlessThreadAnswer =
+  | { kind: "question"; requestId: string; answers: string[][] }
+  | { kind: "permission"; requestId: string; decision: "once" | "reject" };
+
 export interface HeadlessThreadClient extends AgentSessionClient {
+  /**
+   * The pending permission or question that holds a thread, read from the
+   * engine's own request lists. Two small reads; no transcript.
+   */
+  getThreadWaitingFor(threadId: string, input?: { signal?: AbortSignal }): Promise<HeadlessThreadWaitingFor>;
+  /** The request a thread waits on, a permission before a question, with what is needed to answer it. */
+  getThreadPending(threadId: string, input?: { signal?: AbortSignal }): Promise<HeadlessThreadPending | null>;
+  /**
+   * Answers the thread's pending request through the engine's own reply path,
+   * after checking it is still pending and the answers fit. A request that is
+   * no longer pending fails with code `stale_request`; misfit answers with
+   * `invalid_answer`. Nothing is sent in either case.
+   */
+  answerThread(threadId: string, answer: HeadlessThreadAnswer, input?: { signal?: AbortSignal }): Promise<void>;
   waitForThread(threadId: string, input: HeadlessThreadWaitInput): Promise<HeadlessThreadWaitResult>;
   waitUntilIdle(threadId: string, input: HeadlessThreadWaitInput): Promise<HeadlessThreadWaitResult>;
   exportTranscript(threadId: string, input?: { signal?: AbortSignal }): Promise<HeadlessThreadTranscript>;
@@ -227,6 +296,7 @@ export interface HeadlessThreadClientOptions {
    * engine its chats use, so headless threads land where the app reads them.
    */
   engine?: HeadlessThreadEngine | "auto";
+  requireModelAvailability?: boolean;
   /** Default `waitForThread` poll interval. Defaults to 500ms. */
   pollIntervalMs?: number;
   /** Bounds every individual HTTP request. Defaults to 15 seconds; use 0 to disable. */

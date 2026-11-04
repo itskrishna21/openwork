@@ -55,6 +55,7 @@ import { continueCloudProvisioning, token } from "../workers/shared.js"
 type CloudRouteOptions = CloudRuntimeAvailabilityOptions & {
   memberRoute?: MiddlewareHandler<{ Variables: OrgRouteVariables }>
   orgMode?: DenOrgMode
+  openworkWebEnabled?: boolean
   gatewayKey?: string
   continueProvisioning?: typeof continueCloudProvisioning
   refreshSignedPreview?: RefreshSignedPreview
@@ -107,7 +108,7 @@ type CloudInstanceUpdateResponse =
   | { ok: true; status: "update_requested" }
   | { ok: false; error: "already_current" | "flush_failed" | "busy" | "activity_unknown" }
 type CloudWorkerStore = CloudRuntimeStore & {
-  getCloudWorker: (input: { orgId: OrgId; userId: UserId }) => Promise<CloudWorker | null>
+  getCloudWorker: (input: { orgId: OrgId; userId: UserId; primary?: boolean }) => Promise<CloudWorker | null>
   insertCloudWorkerWithTokens: (input: {
     workerId: WorkerId
     orgId: OrgId
@@ -249,7 +250,7 @@ const databaseCloudWorkerStore: CloudWorkerStore = {
     // instances. Follow-up: admin user deletion currently nulls
     // created_by_user_id (src/user-deletion.ts), orphaning instances; cleanup is
     // tracked separately.
-    const rows = await db
+    const rows = await (input.primary ? db.$primary : db)
       .select()
       .from(WorkerTable)
       .where(and(
@@ -339,12 +340,14 @@ const databaseCloudWorkerStore: CloudWorkerStore = {
   },
 }
 
-// Deployment-level availability only. The single-org and no-provisioner 404s
-// are unchanged from the retired per-organization rollout gate, which also
-// returned false outside multi_org; organization entitlement is the separate
-// Web access check on each execution route.
+// Deployment-level availability only: multi-org, or a single-org install with
+// OpenWork Web turned on, plus a configured runtime provider. Organization
+// entitlement is the separate Web access check on each execution route.
 function cloudAvailable(payload: NonNullable<OrgRouteVariables["organizationContext"]>, options: CloudRouteOptions) {
-  return cloudHostingAvailable({ orgMode: options.orgMode ?? env.orgMode })
+  return cloudHostingAvailable({
+    orgMode: options.orgMode ?? env.orgMode,
+    openworkWebEnabled: options.openworkWebEnabled ?? env.openworkWebEnabled,
+  })
     && cloudRuntimeAvailable({ provisionerMode: options.provisionerMode, daytonaApiKey: options.daytonaApiKey })
 }
 
@@ -400,8 +403,8 @@ function gatewaySecretMatches(requestSecret: string | undefined, configuredSecre
   return timingSafeStringEqual(candidate, expected)
 }
 
-async function getCloudWorker(orgId: OrgId, userId: UserId, store: CloudWorkerStore) {
-  return store.getCloudWorker({ orgId, userId })
+async function getCloudWorker(orgId: OrgId, userId: UserId, store: CloudWorkerStore, options: { primary?: boolean } = {}) {
+  return store.getCloudWorker({ orgId, userId, ...options })
 }
 
 async function createCloudWorker(input: {
@@ -426,7 +429,8 @@ async function createCloudWorker(input: {
     activityToken,
   })
 
-  const canonical = await getCloudWorker(input.orgId, input.createdByUserId, input.store)
+  // Primary: must see the row inserted above and any concurrent winner.
+  const canonical = await getCloudWorker(input.orgId, input.createdByUserId, input.store, { primary: true })
   if (canonical && canonical.id !== workerId) {
     // No unique index exists for (org_id, created_by_user_id, destination,
     // sandbox_backend), and a partial unique is not viable across legacy rows.

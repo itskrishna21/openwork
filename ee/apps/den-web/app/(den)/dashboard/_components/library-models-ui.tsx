@@ -1,12 +1,13 @@
 "use client";
 
-import { ChevronRight, LoaderCircle, LockKeyhole } from "lucide-react";
+import { ChevronRight, LoaderCircle } from "lucide-react";
 import { DenBrandMark } from "../../_components/ui/brand-mark";
 import { DenButton } from "../../_components/ui/button";
 import { getLibraryModelRoute, getLibraryRoute } from "../../_lib/den-org";
 import { useOrgDashboard } from "../_providers/org-dashboard-provider";
 import { ItemHeader, ItemPage, SectionTitle } from "./item-header";
-import { ItemMenu, ItemPanel, LibraryListRow } from "./item-list";
+import { ItemMenu, ItemPanel } from "./item-list";
+import { LibraryCompactRow } from "./library-compact";
 import {
   type LibraryModelProvider,
   modelCount,
@@ -28,41 +29,27 @@ export function ProviderLogo({ provider, size = "sm" }: { provider: Pick<Library
   );
 }
 
-function WaitingOnAdmin() {
-  return (
-    <span className="inline-flex items-center gap-1.5">
-      <LockKeyhole className="h-3.5 w-3.5" aria-hidden />
-      Waiting on your admin
-    </span>
-  );
-}
-
 /** One provider in My Library, with the one thing the person can do about it on the right. */
 export function LibraryModelRow({ provider, signIn }: { provider: LibraryModelProvider; signIn: ModelSignIn }) {
   const { orgSlug } = useOrgDashboard();
   const waiting = signIn.waitingFor === provider.id;
   const failure = signIn.failureFor(provider.id);
-  const status = provider.state === "blocked"
-    ? <WaitingOnAdmin />
-    : waiting ? "Finish signing in in your browser"
-      : failure ?? modelCount(provider.models.length);
-  const action = provider.state === "blocked" ? null
-    : waiting ? <DenButton variant="ghost" size="xs" onClick={signIn.cancel}>Cancel</DenButton>
-      : provider.state === "needs_signin" ? (
-        <DenButton variant="secondary" size="xs" onClick={() => void signIn.signIn(provider)}>
-          {failure ? "Try again" : "Sign in"}
-        </DenButton>
-      ) : <ChevronRight className="h-4 w-4 text-gray-400" aria-hidden />;
+  const notice = provider.state === "blocked" ? "Your admin needs to finish setup" : waiting ? "Finish signing in in your browser" : failure;
+  const action = waiting ? <DenButton variant="ghost" size="xs" onClick={signIn.cancel}>Cancel</DenButton>
+    : provider.state === "needs_signin" ? (
+      <DenButton variant="secondary" size="xs" aria-label={failure ? "Try again" : "Sign in"} onClick={() => void signIn.signIn(provider)}>{failure ? "Try again" : "Sign in"}</DenButton>
+    ) : provider.state === "blocked" ? <span className="text-[12px] text-[var(--dls-text-secondary)]">Set up</span> : undefined;
   return (
-    <div data-library-item={provider.name} data-library-kind="model" data-model-state={provider.state} title={modelNamesSummary(provider.models)}>
-      <LibraryListRow
+    <div data-model-state={provider.state} title={notice ?? modelNamesSummary(provider.models)}>
+      <LibraryCompactRow
         href={getLibraryModelRoute(orgSlug, provider.id)}
-        logo={<ProviderLogo provider={provider} />}
-        title={provider.name}
-        ready={provider.state === "ready"}
-        kind="Model"
-        status={status}
-        action={action ?? <span />}
+        kind="model"
+        testName={provider.name}
+        logo={<DenBrandMark name={provider.name} simpleIconSlug={provider.iconSlug} className="h-6 w-6 rounded-md border-gray-200" imageClassName="h-3.5 w-3.5" />}
+        name={provider.name}
+        description={notice ?? modelNamesSummary(provider.models)}
+        action={action}
+        revealAction={false}
       />
     </div>
   );

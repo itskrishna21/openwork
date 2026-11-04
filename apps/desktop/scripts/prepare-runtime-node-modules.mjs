@@ -6,8 +6,14 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 const dirnameHere = dirname(fileURLToPath(import.meta.url));
 const desktopRoot = resolve(dirnameHere, "..");
 const requiredRoots = [{
+  name: "@openwork/computer-use", resolveTarget: "@openwork/computer-use/computer-control",
+}, {
   name: "@modelcontextprotocol/sdk",
   resolveTarget: "@modelcontextprotocol/sdk/validation/ajv",
+}, {
+  // Imported by Electron's feature-gated session adapter; ensure plain-node
+  // ESM is included even when pnpm's workspace collector skips a symlink.
+  name: "@openwork/remote-sessions",
 }];
 
 function packageRoot(name, fromPackageJson, resolveTarget = name) {
@@ -16,12 +22,16 @@ function packageRoot(name, fromPackageJson, resolveTarget = name) {
   try {
     current = dirname(requireFromPackage.resolve(resolveTarget));
   } catch (error) {
-    const linkedPackageRoot = resolve(dirname(dirname(fromPackageJson)), name);
-    try {
-      const linkedPackageJson = JSON.parse(readFileSync(join(linkedPackageRoot, "package.json"), "utf8"));
-      if (linkedPackageJson.name === name) return { root: linkedPackageRoot, packageJson: linkedPackageJson };
-    } catch {
-      // Preserve the original module-resolution error below.
+    // A dependency may export only subpaths. Find its manifest through Node's
+    // normal search directories without requiring a nonexistent root export.
+    for (const searchDirectory of requireFromPackage.resolve.paths(name) ?? []) {
+      const linkedPackageRoot = resolve(searchDirectory, name);
+      try {
+        const linkedPackageJson = JSON.parse(readFileSync(join(linkedPackageRoot, "package.json"), "utf8"));
+        if (linkedPackageJson.name === name) return { root: linkedPackageRoot, packageJson: linkedPackageJson };
+      } catch {
+        // Preserve the original module-resolution error if no package matches.
+      }
     }
     throw error;
   }
@@ -62,8 +72,18 @@ export function stageRuntimeNodeModules(outdir) {
     cpSync(resolvedPackage.root, destination, {
       recursive: true,
       dereference: true,
-      filter: (source) => source === resolvedPackage.root
-        || !relative(resolvedPackage.root, source).split(sep).includes("node_modules"),
+      filter: (source) => {
+        if (source === resolvedPackage.root) return true;
+        const parts = relative(resolvedPackage.root, source).split(sep);
+        if (parts.includes("node_modules")) return false;
+        // The core's published entrypoints are dist (Node) and src (Bun/dev).
+        // Do not ship checkout-only tests, tooling or incidental local links.
+        if (name === "@openwork/remote-sessions") return ["dist", "src", "package.json"].includes(parts[0]);
+        // Native builds ship as a separate helper. Copying this workspace's
+        // Swift .build cache into asar would duplicate the compiler artifacts.
+        if (name === "@openwork/computer-use") return ["dist", "package.json"].includes(parts[0]) || parts.length === 1 && /\.(?:mjs|d\.mts|py)$/.test(parts[0]) && !parts[0].endsWith(".test.mjs");
+        return true;
+      },
     });
     staged.push(destination.slice(output.length + 1));
     const dependencies = resolvedPackage.packageJson.dependencies ?? {};
