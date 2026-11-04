@@ -8,16 +8,26 @@ import { externalFetch } from "./server-fetch.js";
 import { ApiError } from "./errors.js";
 import { clearManagedDesktopPolicy, readGlobalRuntimeOpencodeConfig, writeManagedDesktopPolicy, runtimeProviderMap } from "./runtime-opencode-config-store.js";
 import { policyDenial, policyRequestActions, type ManagedPolicyAction } from "./managed-policy-rules.js";
+import { agentPermissionDenial, agentPermissionRulesOf } from "./agent-permission-engine.js";
+import type { AgentPermissionAction, AgentPermissionRule } from "@openwork/types/den/agent-permissions-runtime";
+
+/** Only the rules enforced by the host surface requesting them. */
+export function agentPermissionRulesForActions(rules: readonly AgentPermissionRule[], actions: readonly AgentPermissionAction[]): AgentPermissionRule[] {
+  return rules.filter((rule) => actions.includes(rule.action));
+}
 
 const services = new WeakMap<ServerConfig, ManagedDesktopPolicy>();
-/** Org-managed providers: Den-imported (lpr_), Gateway (ipr_) and hosted OpenWork Models. */
-const MANAGED_PROVIDER = /^(?:lpr_|ipr_)|^openwork$/i;
-function sessionKey(session: CloudProviderDenSession) { return `${session.baseUrl}\n${session.orgId}`; }
+/** Org-managed providers: Den-imported (lpr_), Gateway (ipr_), hosted OpenWork Models and Smart Routers. */
+const MANAGED_PROVIDER = /^(?:lpr_|ipr_)|^openwork(?:-auto)?$/i;
+/** One member's sign-in: another member of the same organization has another token. */
+function sessionKey(session: CloudProviderDenSession) { return `${session.baseUrl}\n${session.orgId}\n${session.token}`; }
 // The first cold read previously had 10s; keep two reads under the 15s plugin budget and one read under the 10s session-install budget.
 const DEN_READ_DEADLINE_MS = 6_000;
 const DEN_READ_ATTEMPT_TIMEOUT_MS = 3_500;
 const DEN_READ_MAX_ATTEMPTS = 2;
 const DEN_READ_RETRY_DELAY_MS = 200;
+// How long a `standardCodeMode` read is reused, as the desktop app's feature reads are.
+const FEATURE_STALE_MS = 30_000;
 const RETRYABLE_DEN_STATUSES = new Set([502, 503, 504]);
 const RETRYABLE_TRANSPORT_CODES = new Set([
   "ABORT_ERR",
@@ -71,7 +81,11 @@ class ManagedDesktopPolicy {
   private fetching: { generation: number; promise: Promise<DesktopConfig | null> } | undefined;
   /** The last policy verified for this sign-in, used while a fresh read is in flight or Den is unreachable. */
   private lastKnown: { key: string; policy: DesktopConfig } | undefined;
+  /** The last `standardCodeMode` read for this sign-in. */
+  private standardCodeMode: { generation: number; at: number; enabled: boolean } | undefined;
   onChange: (() => void) | undefined;
+  /** Live rollout state, independent of persisted model and permission changes. */
+  onV2OnlyChange: ((enabled: boolean) => void) | undefined;
   constructor(private readonly config: ServerConfig) {}
   authenticatesEvaluation(request: Request): boolean {
     const supplied = request.headers.get("authorization")?.match(/^Bearer\s+(.+)$/i)?.[1];
@@ -84,11 +98,19 @@ class ManagedDesktopPolicy {
     // The desktop re-delivers the same identity on every launch, reload, and
     // resume. Only a different account may invalidate in-flight verifications.
     const current = this.session;
-    if (!current || current.baseUrl !== session.baseUrl || current.token !== session.token || current.orgId !== session.orgId) {
+    if (!current || sessionKey(current) !== sessionKey(session)) {
       this.generation++;
       this.installed = undefined;
+      this.onV2OnlyChange?.(false);
     }
     this.session = session;
+    if (current && sessionKey(current) !== sessionKey(session)) {
+      // Another sign-in, even in the same organization, never keeps the
+      // previous one's policy: not while Den is unreachable, nor in the engine.
+      this.lastKnown = undefined;
+      const cleared = await clearManagedDesktopPolicy(this.config);
+      if (cleared.changed) this.onChange?.();
+    }
     // Installing an identity never waits on Den while only model access is enforced.
     if (DESKTOP_POLICY_ENFORCEMENT_ENABLED) await this.current();
     else void this.current().catch(() => undefined);
@@ -98,6 +120,7 @@ class ManagedDesktopPolicy {
     this.generation++;
     this.installed = undefined;
     this.lastKnown = undefined;
+    this.onV2OnlyChange?.(false);
     const cleared = await clearManagedDesktopPolicy(this.config);
     if (cleared.changed) this.onChange?.();
   }
@@ -128,7 +151,9 @@ class ManagedDesktopPolicy {
       if (remainingMs <= 0) throw new Error("Den read deadline exceeded");
       try {
         const response = await externalFetch(`${session.baseUrl}${path}`, {
-          headers: { Accept: "application/json", Authorization: `Bearer ${session.token}`, "x-openwork-org-id": session.orgId, "x-openwork-legacy-org-id": session.orgId },
+          headers: { Accept: "application/json", Authorization: `Bearer ${session.token}`, "x-openwork-org-id": session.orgId, "x-openwork-legacy-org-id": session.orgId,
+            ...(path === "/v1/me/desktop-config" ? { "X-OpenWork-Browser-Upload-Permissions": "1" } : {}),
+          },
           redirect: "error",
           signal: AbortSignal.timeout(Math.min(DEN_READ_ATTEMPT_TIMEOUT_MS, remainingMs)),
         });
@@ -175,26 +200,53 @@ class ManagedDesktopPolicy {
     try {
       policy = desktopConfigSchema.parse(await this.readDenJson(session, "/v1/me/desktop-config", generation));
     } catch (error) {
+      this.identityChanged(generation);
       if (error instanceof ApiError && error.code === "policy_identity_changed") throw error;
+      this.onV2OnlyChange?.(false);
       if (!DESKTOP_POLICY_ENFORCEMENT_ENABLED) {
         // Never block on Den: keep the last policy verified for this sign-in, or none.
         console.warn("[openwork:model-access] Den unreachable; using the last known model access");
-        return this.lastKnown?.key === sessionKey(session) ? this.lastKnown.policy : null;
+        // Model access/permissions keep their offline policy. A rollout is
+        // different: a stale grant must not re-enable v2-only mode after its
+        // kill switch changed while disconnected.
+        return this.lastKnown?.key === sessionKey(session) ? { ...this.lastKnown.policy, opencodeV2Only: false } : null;
       }
       throw new ApiError(403, "policy_unavailable", "Your organization's policy could not be verified. Try again when connected.");
     }
     if (generation !== this.generation) throw new ApiError(409, "policy_identity_changed", "The signed-in account changed. Retry the action.");
-    // While only model access is enforced, cache a policy only when it restricts models, so
-    // organizations without it keep exactly the engine config and reload behaviour they had.
+    // While only model access and agent permissions are enforced, cache a policy only when it carries
+    // one of them, so other organizations keep exactly the engine config and reload behaviour they had.
     const restrictsModelAccess = policy.allowCustomProviders === false;
-    const result = DESKTOP_POLICY_ENFORCEMENT_ENABLED || restrictsModelAccess
+    const hasAgentPermissions = (policy.agentPermissions?.rules.length ?? 0) > 0;
+    const result = DESKTOP_POLICY_ENFORCEMENT_ENABLED || restrictsModelAccess || hasAgentPermissions
       ? await writeManagedDesktopPolicy(this.config, policy)
       : await clearManagedDesktopPolicy(this.config);
     if (generation !== this.generation) throw new ApiError(409, "policy_identity_changed", "The signed-in account changed. Retry the action.");
     this.installed = { generation, policy };
     this.lastKnown = { key: sessionKey(session), policy };
+    this.onV2OnlyChange?.(policy.opencodeV2Only === true);
     if (result.changed) this.onChange?.();
     return policy;
+  }
+  /**
+   * v1 has no reliable organization external-folder enforcement. Refuse its
+   * execution instead of silently treating either Ask first or Block as Allow.
+   * Guard the forwarding boundary, not request bodies or project config: even
+   * a custom agent, saved command, permission reply or terminal cannot opt out.
+   * Reads and Stop stay available so old chats can be viewed and stopped.
+   */
+  async assertLegacyExecutionRequest(request: Request, path: string): Promise<void> {
+    const decoded = decodeURIComponent(path);
+    const terminal = /\/(?:pty|persistent-pty|terminal)(?:\/|$)/.test(decoded);
+    if (["GET", "HEAD", "OPTIONS"].includes(request.method) && !terminal) return;
+    if (request.method === "POST" && /\/session\/[^/]+\/abort\/?$/.test(decoded)) return;
+    const generation = this.generation;
+    const rules = await this.agentPermissionRulesFor(["external_directory"], true);
+    this.identityChanged(generation);
+    const restrictive = rules.find((rule) => rule.effect !== "allow");
+    if (!restrictive) return;
+    throw new ApiError(403, "organization_policy_denied",
+      `Your organization's agent permissions restrict folders outside the workspace (set for ${restrictive.source}). OpenCode v1 cannot enforce this policy. Use the default OpenCode v2 engine to continue.`);
   }
   async assertRequest(request: Request, path: string, engine = false): Promise<void> {
     if (!DESKTOP_POLICY_ENFORCEMENT_ENABLED) return this.assertProviderUse(request, path, engine);
@@ -268,6 +320,131 @@ class ManagedDesktopPolicy {
     if (!isRecord(body)) return;
     const model = isRecord(body.model) ? body.model : body;
     if (typeof model.providerID === "string") await this.assert("model", { providerID: model.providerID });
+  }
+  /**
+   * Refuses a member adding a local skill or MCP server their agent
+   * permissions block. A policy verified for this sign-in decides; without
+   * one it waits briefly for Den's answer. When Den cannot answer, the member
+   * keeps working with the latest rules stored on this computer, like every
+   * other desktop policy, rather than being refused.
+   */
+  async assertAgentPermission(action: "skill" | "mcp", name: string): Promise<void> {
+    if (!this.session) return;
+    const generation = this.generation;
+    let policy = this.knownPolicy();
+    if (!policy) {
+      policy = await this.current().catch((error: unknown) => {
+        if (error instanceof ApiError && error.code === "policy_identity_changed") throw error;
+        return null;
+      });
+      this.identityChanged(generation);
+    }
+    const rules = policy
+      ? agentPermissionRulesOf(policy)
+      : agentPermissionRulesOf((await readGlobalRuntimeOpencodeConfig(this.config)).managedPolicy);
+    this.identityChanged(generation);
+    const denial = agentPermissionDenial(rules, action, [name]);
+    if (denial) throw new ApiError(403, "organization_policy_denied", denial);
+  }
+  /** Remote computers require the signed-in organization's verified rollout. */
+  async remoteComputersEnabled(): Promise<boolean> {
+    const session = this.session;
+    const generation = this.generation;
+    if (!session) return false;
+    try {
+      const payload = await this.readDenJson(session, "/v1/org", generation);
+      this.identityChanged(generation);
+      const features = isRecord(payload) && isRecord(payload.features) ? payload.features : {};
+      return features.computerUse === true && features.remoteComputers === true;
+    } catch {
+      // Missing, unreachable, signed-out or changed identity never grants access.
+      return false;
+    }
+  }
+
+  /**
+   * The signed-in organization's `standardCodeMode` feature: whether its
+   * computer-use programs run as standard JavaScript. It picks an interpreter
+   * and grants nothing, so a read up to 30 s old for this sign-in is reused.
+   * Missing, unreachable or signed out means off: OpenWork's original Code Mode.
+   */
+  async standardCodeModeEnabled(): Promise<boolean> {
+    const session = this.session;
+    const generation = this.generation;
+    if (!session) return false;
+    const known = this.standardCodeMode;
+    if (known?.generation === generation && Date.now() - known.at < FEATURE_STALE_MS) return known.enabled;
+    try {
+      const payload = await this.readDenJson(session, "/v1/org", generation);
+      this.identityChanged(generation);
+      const features = isRecord(payload) && isRecord(payload.features) ? payload.features : {};
+      const enabled = features.standardCodeMode === true;
+      this.standardCodeMode = { generation, at: Date.now(), enabled };
+      return enabled;
+    } catch {
+      return false;
+    }
+  }
+
+  /**
+   * The member's rules for a desktop host surface, read by the desktop
+   * process itself rather than taken from the app window. Den is asked first
+   * (briefly); when it cannot answer, the policy verified for this sign-in,
+   * else (for non-strict callers only) the latest rules stored on this
+   * computer. Strict legacy execution requires verification bound to the
+   * current sign-in, never the unscoped disk row. Signed out there are none.
+   */
+  private async agentPermissionRulesFor(actions: readonly AgentPermissionAction[], requireVerified = false): Promise<AgentPermissionRule[]> {
+    if (!this.session) return [];
+    const fresh = await Promise.race([
+      this.current().catch(() => null),
+      new Promise<null>((resolve) => setTimeout(() => resolve(null), 5_000)),
+    ]);
+    const verified = fresh ?? this.knownPolicy();
+    // The global runtime row is not bound to a sign-in: a previous org's Allow
+    // (or empty policy) must never authorize legacy execution for this member.
+    // Only a fresh read or the in-memory policy verified for this session can.
+    if (!verified && requireVerified) {
+      throw new ApiError(403, "policy_unavailable", "Your organization's folder permissions could not be verified. Reconnect and try again, or use the default OpenCode v2 engine.");
+    }
+    const policy = verified ?? (await readGlobalRuntimeOpencodeConfig(this.config)).managedPolicy;
+    return agentPermissionRulesForActions(agentPermissionRulesOf(policy), actions);
+  }
+  /**
+   * Upload consent may persist across chats. Its identity and authority must be
+   * fresh and verified, never an old disk policy, renderer state or token hash.
+   * Unreachable Den cannot authorize an upload with a remembered grant.
+   */
+  async browserUploadPolicy(): Promise<{
+    enabled: boolean;
+    scope: { baseUrl: string; organizationId: string; memberId: string } | null;
+    rules: AgentPermissionRule[];
+  }> {
+    const session = this.session;
+    const generation = this.generation;
+    if (!session) return { enabled: false, scope: null, rules: [] };
+    const policy = desktopConfigSchema.parse(await this.readDenJson(session, "/v1/me/desktop-config", generation));
+    this.identityChanged(generation);
+    const uploads = policy.browserUploadPermissions;
+    if (!uploads?.enabled) return { enabled: false, scope: null, rules: [] };
+    if (uploads.organizationId !== session.orgId || !uploads.memberId) {
+      throw new ApiError(403, "policy_identity_changed", "The signed-in file-sharing account could not be verified.");
+    }
+    return {
+      enabled: true,
+      scope: { baseUrl: session.baseUrl, organizationId: uploads.organizationId, memberId: uploads.memberId },
+      rules: agentPermissionRulesForActions(agentPermissionRulesOf(policy), ["browser_upload"]),
+    };
+  }
+  websiteRules(): Promise<AgentPermissionRule[]> {
+    return this.agentPermissionRulesFor(["webfetch"]);
+  }
+  computerRules(): Promise<AgentPermissionRule[]> {
+    return this.agentPermissionRulesFor(["computer", "script"]);
+  }
+  /** The desktop config verified for this sign-in, without waiting on Den. Null signed out or before Den first answered. */
+  known(): DesktopConfig | null {
+    return this.knownPolicy();
   }
   /** The policy to enforce now: verified for this sign-in, else the last one verified for it; never waits on Den. */
   private knownPolicy(): DesktopConfig | null {

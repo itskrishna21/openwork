@@ -1,7 +1,8 @@
 name: Warden
 
-# Keep these actions aligned with warden.toml. Warden Clearance
-# (warden-clearance.yml) reads this run's warden-summary receipt to approve.
+# Keep these actions aligned with warden.toml. The advisory reporter
+# (warden-clearance.yml) reads this run's warden-summary receipt, never approves.
+# Incomplete analysis fails the job for observability, not as a merge requirement.
 on:
   pull_request:
     types: [opened, synchronize, reopened, ready_for_review]
@@ -19,7 +20,9 @@ jobs:
   warden:
     if: github.event.pull_request.head.repo.full_name == github.repository
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    # Up to 400 files / 60,000 changed lines (warden.toml); the largest PRs
+    # take well over 20 minutes.
+    timeout-minutes: 60
     steps:
       - name: Start timing
         id: timing

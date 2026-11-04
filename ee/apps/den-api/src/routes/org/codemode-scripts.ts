@@ -1,5 +1,6 @@
 import { liveArtifactConnectionFailure } from "../../mcp/capability-registry.js"
 import { artifactRunInputSchema } from "../../artifact-runtime.js"
+import { libraryWorkflowLink } from "../../agent-links.js"
 import type { Hono } from "hono"
 import { describeRoute } from "hono-openapi"
 import { z } from "zod"
@@ -32,6 +33,7 @@ import { env } from "../../env.js"
 import { getOrganizationFeatures } from "../../features.js"
 import { getCatalog } from "../../mcp/index.js"
 import { buildCapabilityToolTree, createCapabilityRegistryContext } from "../../mcp/capability-registry.js"
+import type { BuildCodemodeTools } from "../../mcp/codemode-tools.js"
 import {
   executeMarketplaceCapability,
   listAccessibleWorkflows,
@@ -49,6 +51,7 @@ import {
 } from "../../artifact-views.js"
 
 import { getSavedApp, listSavedApps, setAppOnDashboard, shareSavedApp } from "../../saved-apps.js"
+import { primaryReadsMiddleware } from "../../read-routing.js"
 
 const capabilitySchema = z.object({ capabilityName: z.string(), scriptPath: z.string() })
 const scriptSchema = z.object({
@@ -80,6 +83,8 @@ const savedSchema = z.object({
   configObjectVersionId: z.string(),
   graph: workflowGraphSchema,
   mermaid: z.string(),
+  name: z.string().describe("The name the Workflow was saved under; tell the person \"Saved as <name>\"."),
+  libraryUrl: z.string().describe("The Workflow's page in the member's Library, where they run, schedule and share it. Give the person this link."),
 })
 const runParamsSchema = z.object({ configObjectId: z.string().min(1).max(160) })
 const runSchema = z.object({
@@ -142,6 +147,7 @@ const workflowLibraryDetailSchema = z.object({
     role: z.enum(["viewer", "editor", "manager"]), edges: z.array(z.unknown()),
     state: z.enum(["ready", "needs_signin", "needs_admin_setup"]),
     resultState: z.enum(["never_run", "fresh", "stale", "needs_attention"]),
+    failureReason: z.string().nullable().optional(),
     latestSuccessfulAt: z.string().datetime().nullable(),
     viewState: z.enum(["default", "custom_active", "build_failed", "retired"]),
     activeViewTitle: z.string().nullable(), automationCount: z.number().int().nonnegative(),
@@ -155,6 +161,14 @@ const artifactViewParamsSchema = z.object({
   artifactViewId: z.string().trim().min(1).max(160),
   revisionId: z.string().trim().min(1).max(160).optional(),
 })
+
+/**
+ * A save that comes too long after the test run is not the person's problem:
+ * the agent runs the same steps again and saves, and says only what the person
+ * would notice. They never hear about receipts or retention.
+ */
+const SAVE_RECOVERY = "Do this without asking: run the same code again with execute_capability_script (same input and schemas), then call saveWorkflow with the new receiptId and the agreed name. Tell the person only userMessage, never receipts, retention or error codes."
+const SAVE_RECOVERY_USER_MESSAGE = "That run was a little while ago, so I'm running it once more to save it."
 
 function routeFailure(error: unknown) {
   if (error instanceof PluginArchAuthorizationError) {
@@ -182,6 +196,8 @@ function routeFailure(error: unknown) {
       body: {
         error: message,
         message: "A matching successful authoring receipt and its retained source are required. Source retention lasts at most 15 minutes and is shared across replicas when Redis is configured, otherwise process-local. Configured storage failures do not fall back locally. Retest and use the new receiptId with unchanged source, input, and schemas, or omit receiptId and supply the exact tested source.",
+        recovery: SAVE_RECOVERY,
+        userMessage: SAVE_RECOVERY_USER_MESSAGE,
       },
     } as const
   }
@@ -194,6 +210,8 @@ function routeFailure(error: unknown) {
       body: {
         error: message,
         message: "Run the exact procedure successfully with execute_capability_script, then retry saving the Workflow without changing the code. The successful run must be less than 15 minutes old. The match is byte-exact on the code string, so re-send the identical source (same whitespace) that succeeded.",
+        recovery: SAVE_RECOVERY,
+        userMessage: SAVE_RECOVERY_USER_MESSAGE,
       },
     } as const
   }
@@ -257,9 +275,11 @@ export function registerOrgWorkflowRoutes<T extends { Variables: OrgRouteVariabl
       member,
       redirectUriBase: env.apiPublicUrl ?? "http://127.0.0.1",
       generatedArtifactViewsEnabled: env.generatedArtifactViewsEnabled,
-      organizationFeatures: await getOrganizationFeatures(context.organization.id),
+      organizationFeatures: await getOrganizationFeatures(context.organization.id, { userId: context.currentMember.userId }),
+      // Den web and REST callers run saved Workflows here.
+      usageSource: "workflow",
     })
-    const buildTools = () => buildCapabilityToolTree(capabilityContext)
+    const buildTools: BuildCodemodeTools = (required) => buildCapabilityToolTree(capabilityContext, required)
     const actorContext = { organizationContext: context, memberTeams: teams, session: c.get("session") }
     return { context, member, actorContext, buildTools, describeUnavailable: (missing: readonly { capabilityName: string }[]) => liveArtifactConnectionFailure(capabilityContext, missing) }
   }
@@ -291,7 +311,7 @@ export function registerOrgWorkflowRoutes<T extends { Variables: OrgRouteVariabl
         404: jsonResponse("Plugin not found.", notFoundSchema),
       },
     }),
-    orgMemberRoute(), jsonValidator(saveSchema),
+    orgMemberRoute(), primaryReadsMiddleware, jsonValidator(saveSchema),
     async (c) => {
       try {
         const { context, actorContext, buildTools } = await contextFor(c)
@@ -306,7 +326,7 @@ export function registerOrgWorkflowRoutes<T extends { Variables: OrgRouteVariabl
           buildTools,
           context: actorContext,
         })
-        return c.json(saved, 201)
+        return c.json({ ...saved, name: body.name, libraryUrl: libraryWorkflowLink(saved.configObjectId) }, 201)
       } catch (error) {
         const failure = routeFailure(error)
         return c.json(failure.body, failure.status)
@@ -375,7 +395,7 @@ export function registerOrgWorkflowRoutes<T extends { Variables: OrgRouteVariabl
         404: jsonResponse("App or teammate not found.", notFoundSchema),
       },
     }),
-    orgMemberRoute(),
+    orgMemberRoute(), primaryReadsMiddleware,
     jsonValidator(z.object({ email: z.string().trim().email().max(320) })),
     async (c) => {
       if (!env.generatedArtifactViewsEnabled) return c.json({ error: "artifact_view_not_found" }, 404)
@@ -423,7 +443,7 @@ export function registerOrgWorkflowRoutes<T extends { Variables: OrgRouteVariabl
         200: jsonResponse("Dashboard updated.", z.object({ ok: z.literal(true) })),
       },
     }),
-    orgMemberRoute(), jsonValidator(z.object({ added: z.boolean() })),
+    orgMemberRoute(), primaryReadsMiddleware, jsonValidator(z.object({ added: z.boolean() })),
     async (c) => {
       if (!env.generatedArtifactViewsEnabled) return c.json({ error: "artifact_view_not_found" }, 404)
       try {
@@ -446,7 +466,7 @@ export function registerOrgWorkflowRoutes<T extends { Variables: OrgRouteVariabl
         200: jsonResponse("App saved.", generatedArtifactViewSchema),
       },
     }),
-    orgMemberRoute(),
+    orgMemberRoute(), primaryReadsMiddleware,
     jsonValidator(saveAppSchema),
     async (c) => {
       if (!env.generatedArtifactViewsEnabled) return c.json({ error: "artifact_view_not_found" }, 404)
@@ -500,7 +520,7 @@ export function registerOrgWorkflowRoutes<T extends { Variables: OrgRouteVariabl
         404: jsonResponse("Artifact view or revision not found, or generated Artifact views are disabled.", notFoundSchema),
       },
     }),
-    orgMemberRoute(),
+    orgMemberRoute(), primaryReadsMiddleware,
     async (c) => {
       if (!env.generatedArtifactViewsEnabled) return c.json({ error: "artifact_view_not_found" }, 404)
       const params = artifactViewParamsSchema.safeParse(c.req.param())
@@ -527,7 +547,7 @@ export function registerOrgWorkflowRoutes<T extends { Variables: OrgRouteVariabl
         404: jsonResponse("Artifact view not found, or generated Artifact views are disabled.", notFoundSchema),
       },
     }),
-    orgMemberRoute(),
+    orgMemberRoute(), primaryReadsMiddleware,
     async (c) => {
       if (!env.generatedArtifactViewsEnabled) return c.json({ error: "artifact_view_not_found" }, 404)
       const params = artifactViewParamsSchema.safeParse(c.req.param())
@@ -671,7 +691,7 @@ export function registerOrgWorkflowRoutes<T extends { Variables: OrgRouteVariabl
       description: "Appends a new immutable version to the Workflow and updates its name and description. receiptId must reference a successful draft test by the caller that is less than 15 minutes old, has not already produced a version, and whose code, exampleInput, inputSchema, outputSchema, name, description, and requiredCapabilities all match this body byte-for-byte (400 workflow_matching_test_receipt_required). Every capability the test actually called must be listed in requiredCapabilities and still be available to the caller (400 workflow_capability_unavailable). Requires manager access to the Workflow.",
       responses: { 201: jsonResponse("Workflow version created.", workflowDetailSchema), 400: jsonResponse("Version rejected.", invalidRequestSchema) },
     }),
-    orgMemberRoute(), jsonValidator(versionSchema),
+    orgMemberRoute(), primaryReadsMiddleware, jsonValidator(versionSchema),
     async (c) => {
       const params = detailParamsSchema.safeParse(c.req.param())
       if (!params.success) return c.json({ error: "invalid_request", message: "Invalid Workflow id." }, 400)
@@ -754,7 +774,7 @@ export function registerOrgWorkflowRoutes<T extends { Variables: OrgRouteVariabl
         404: jsonResponse("Workflow or snapshot not found.", notFoundSchema),
       },
     }),
-    orgMemberRoute(),
+    orgMemberRoute(), primaryReadsMiddleware,
     async (c) => {
       const params = detailParamsSchema.safeParse(c.req.param())
       if (!params.success || !params.data.receiptId) return c.json({ error: "invalid_request", message: "Invalid snapshot id." }, 400)

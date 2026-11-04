@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto"
 import type { AutomationClaimResult, AutomationListItem } from "@openwork/automations"
-import { AUTOMATION_MANUAL_CLAIM_WINDOW_MS, desktopRunnerConnected } from "@openwork/automations"
-import { AUTOMATION_RUNNER_WORK_RUN_LIMIT, isAutomationCloudDefaultModel } from "@openwork/types/automations"
+import { AUTOMATION_MANUAL_CLAIM_WINDOW_MS, calendarTriggerPrompt, desktopRunnerConnected } from "@openwork/automations"
+import { AUTOMATION_RUNNER_WORK_RUN_LIMIT, REMOTE_SESSION_ONLY_RUNNER_CAPABILITY, isAutomationCloudDefaultModel } from "@openwork/types/automations"
 import type {
   AutomationCloudTarget,
   AutomationDesktopRunnerCapability,
@@ -14,6 +14,9 @@ import type {
   AutomationRunEventType,
   AutomationRun,
   AutomationAction,
+  AutomationRunTriggerContext,
+  AutomationSchedule,
+  AutomationScheduleKind,
   CreateAutomationDefinition,
   DesktopRunnerInventory,
   UpdateAutomation,
@@ -22,9 +25,13 @@ import { env } from "../env.js"
 import { isActiveAutomationOwner, resolveAutomationModelAccess } from "./authority.js"
 import { shouldApplyAutomationModelAccessFailure } from "./model-attention-rollout.js"
 import { automationRepository, runWorkspaceId } from "./repository.js"
+import { recordAutomationRunCompleted, recordAutomationRunStarted } from "./audit.js"
 import { validateWorkflowAutomationAction } from "../workflows.js"
 import type { CloudAgentExecution, CloudAgentExecutorInput } from "./cloud-agent-executor.js"
 import { cloudAutomationRuntime, HEADLESS_AGENT_ENGINE_KIND, type CloudAutomationRuntime } from "./headless-runtime.js"
+import { automationTargetAllowed } from "./organization-availability.js"
+import { CalendarTriggerSource, type CalendarTriggerSourceDeps } from "./calendar-trigger-source.js"
+import { normalizeDenTypeId } from "@openwork-ee/utils/typeid"
 import { appLogger } from "../observability/logger.js"
 import {
   getOpenWorkWebRuntimeAccess,
@@ -51,6 +58,16 @@ type OwnerScope = {
   organizationId: string
   ownerMemberId: string
   modelAttentionCapable?: boolean
+  /**
+   * Schedule kinds the caller can read. Released desktops parse schedules
+   * strictly, so Automations with other kinds are left out of what they get,
+   * as if they did not exist. Absent or null: every kind.
+   */
+  readableScheduleKinds?: ReadonlySet<AutomationScheduleKind> | null
+}
+
+function readableBy(scope: OwnerScope, schedule: AutomationSchedule) {
+  return !scope.readableScheduleKinds || scope.readableScheduleKinds.has(schedule.kind)
 }
 
 /**
@@ -131,17 +148,65 @@ export function configureHeadlessAgentExecutor(execute: (input: CloudAgentExecut
 export type AutomationServiceOptions = {
   getOpenWorkWebAccess?: OpenWorkWebRuntimeAccessResolver
   cloudRuntime?: (organizationId: string) => Promise<CloudAutomationRuntime>
+  /** Reads an owner's primary Google Calendar around now. */
+  readCalendar?: CalendarTriggerSourceDeps["read"]
+}
+
+async function readOwnerCalendar(input: Parameters<CalendarTriggerSourceDeps["read"]>[0]) {
+  // Imported on first use: the route module is large and the scheduler only needs this one read.
+  const { readMemberGoogleCalendar } = await import("../routes/org/google-workspace.js")
+  return readMemberGoogleCalendar({
+    organizationId: normalizeDenTypeId("organization", input.organizationId),
+    orgMembershipId: normalizeDenTypeId("member", input.ownerMemberId),
+    timeMin: input.timeMin,
+    timeMax: input.timeMax,
+  })
 }
 
 export class AutomationService {
   private readonly cloudExecutions = new Map<string, Promise<void>>()
   private readonly getOpenWorkWebAccess: OpenWorkWebRuntimeAccessResolver
   private readonly cloudRuntime: (organizationId: string) => Promise<CloudAutomationRuntime>
+  private readonly calendarTriggers: CalendarTriggerSource
   private runnerPruneDueAt = 0
 
   constructor(options: AutomationServiceOptions = {}) {
     this.getOpenWorkWebAccess = options.getOpenWorkWebAccess ?? getOpenWorkWebRuntimeAccess
     this.cloudRuntime = options.cloudRuntime ?? cloudAutomationRuntime
+    this.calendarTriggers = new CalendarTriggerSource({
+      list: (limit) => automationRepository.listActiveCalendarTriggers({ limit }),
+      // GA: Den reads the owner's calendar for every active calendar-triggered Automation,
+      // gated only by Cloud placement and the Google Calendar connection.
+      read: options.readCalendar ?? readOwnerCalendar,
+      claim: (item, occurrence) => this.claimAndDispatch(item, occurrence, Date.now()),
+      needsConnection: async (item, message) => {
+        const now = Date.now()
+        await automationRepository.markNeedsAttention({
+          automationId: item.automation.id,
+          expectedRevisionId: item.revision.id,
+          reason: { code: "connect_access_unavailable", message, occurredAt: now },
+          now,
+        })
+      },
+    })
+  }
+
+  /**
+   * Calendar triggers run only in the cloud; keeping the schedule an
+   * Automation already has needs no check (the per-kind flags are GA).
+   */
+  private requireScheduleAllowed(
+    _scope: OwnerScope,
+    schedule: AutomationSchedule | undefined,
+    target: AutomationExecutionTarget,
+    _current?: AutomationSchedule,
+  ) {
+    if (schedule?.kind === "calendar" && target !== "cloud") throw new Error("automation_calendar_trigger_cloud_only")
+  }
+
+  /** The organization's setting (and, for Cloud, the deployment's headless runner) for this kind of Automation. */
+  private async requireTargetAllowed(organizationId: string, target: AutomationExecutionTarget) {
+    if (!await automationTargetAllowed(organizationId, target)) throw new Error(target === "cloud" ? "automation_cloud_disabled" : "automation_desktop_disabled")
   }
 
   /**
@@ -189,6 +254,7 @@ export class AutomationService {
     target: AutomationExecutionTarget,
     options: AutomationPlacementOptions,
   ) {
+    await this.requireTargetAllowed(scope.organizationId, target)
     if (target === "desktop") {
       if (action?.kind === "saved_script") throw new Error("automation_action_target_mismatch")
       if (options.agentCaller) throw new Error("automation_agent_desktop_placement")
@@ -213,6 +279,7 @@ export class AutomationService {
    * computer whose files a run can use.
    */
   private async cloudTarget(scope: OwnerScope): Promise<AutomationCloudTarget> {
+    if (!await automationTargetAllowed(scope.organizationId, "cloud")) return { kind: "cloud", available: false, runtime: null, cloudComputer: false }
     const runtime = await this.cloudRuntime(scope.organizationId)
     const cloudComputer = await this.cloudComputerAvailable(scope)
     const available = runtime === "headless" ? headlessAgentExecutor !== null || cloudComputer : cloudComputer
@@ -224,13 +291,14 @@ export class AutomationService {
   /** Every place this owner's Automations can run: their registered desktops, then Cloud. */
   async executionTargets(scope: OwnerScope): Promise<AutomationExecutionTargetList> {
     const now = Date.now()
-    const [desktops, cloud] = await Promise.all([
+    const [desktops, cloud, desktopAllowed] = await Promise.all([
       automationRepository.listDesktopRunners({ ...scope, limit: DESKTOP_TARGET_LIST_LIMIT }),
       this.cloudTarget(scope),
+      automationTargetAllowed(scope.organizationId, "desktop"),
     ])
     return {
       items: [
-        ...desktops.map((desktop): AutomationDesktopTarget => ({
+        ...(desktopAllowed ? desktops : []).map((desktop): AutomationDesktopTarget => ({
           kind: "desktop",
           id: desktop.id,
           platform: desktop.platform,
@@ -266,16 +334,20 @@ export class AutomationService {
   }
 
   async list(scope: OwnerScope, input: { cursor?: string; limit?: number }) {
-    const page = await automationRepository.list({ ...scope, cursor: input.cursor, limit: input.limit ?? 50 })
+    const listed = await automationRepository.list({ ...scope, cursor: input.cursor, limit: input.limit ?? 50 })
+    // Filter first: a caller must not reconcile Automations it is not shown.
+    const page = { ...listed, items: listed.items.filter((item) => readableBy(scope, item.revision.schedule)) }
     const modelAccessBySelection = new Map<string, ReturnType<typeof resolveAutomationModelAccess>>()
     const resolveModelAccess = (item: AutomationListItem) => {
-      const key = JSON.stringify([item.revision.model.providerId, item.revision.model.modelId])
+      const executionTarget = item.revision.executionTarget ?? "desktop"
+      const key = JSON.stringify([item.revision.model.providerId, item.revision.model.modelId, executionTarget])
       const existing = modelAccessBySelection.get(key)
       if (existing) return existing
       const access = resolveAutomationModelAccess({
         organizationId: item.automation.organizationId,
         ownerMemberId: item.automation.ownerMemberId,
         ...item.revision.model,
+        executionTarget,
       })
       modelAccessBySelection.set(key, access)
       return access
@@ -295,10 +367,12 @@ export class AutomationService {
 
   async get(scope: OwnerScope, automationId: string) {
     const item = await automationRepository.get({ ...scope, automationId })
-    return item ? this.reconcileModelAttention(item, scope) : null
+    return item && readableBy(scope, item.revision.schedule) ? this.reconcileModelAttention(item, scope) : null
   }
 
   async create(scope: OwnerScope, definition: CreateAutomationDefinition) {
+    this.requireScheduleAllowed(scope, definition.schedule, "action" in definition ? definition.executionTarget : "desktop")
+    await this.requireTargetAllowed(scope.organizationId, "action" in definition ? "cloud" : "desktop")
     if ("action" in definition) {
       if (definition.executionTarget !== "cloud") {
         throw new Error("automation_action_target_mismatch")
@@ -328,6 +402,7 @@ export class AutomationService {
     if (!current) return null
     const currentTarget = current.revision.executionTarget ?? "desktop"
     const nextTarget = changes.executionTarget ?? currentTarget
+    this.requireScheduleAllowed(scope, changes.schedule ?? current.revision.schedule, nextTarget, current.revision.schedule)
     const moved = nextTarget !== currentTarget
     const nextAction = changes.action ?? current.revision.action
     if (nextTarget === "desktop" && nextAction?.kind === "saved_script") {
@@ -403,29 +478,34 @@ export class AutomationService {
     // published desktops surface the returned message in the action toast.
     // Running once on the other target is checked like moving there.
     if (target !== savedTarget) await this.requireTargetMove(scope, current.revision.action, target, options)
-    else if (target === "cloud") await this.requireCloudRuntimeAccess(scope.organizationId)
+    else {
+      await this.requireTargetAllowed(scope.organizationId, target)
+      if (target === "cloud") await this.requireCloudRuntimeAccess(scope.organizationId)
+    }
     // This one occurrence runs on `target`; the Automation keeps its own.
     const revision = { ...current.revision, executionTarget: target }
     let blocked = current.automation.needsAttentionReason
     if (current.revision.action?.kind === "saved_script") {
       if (!await isActiveAutomationOwner(scope)) throw new Error("automation_owner_inactive")
     } else if (!blocked) {
-      const access = await resolveAutomationModelAccess({ ...scope, ...current.revision.model })
+      const access = await resolveAutomationModelAccess({ ...scope, ...current.revision.model, executionTarget: target })
       if (!access.ok && shouldApplyAutomationModelAccessFailure({
         model: current.revision.model,
         failure: access,
+        executionTarget: target,
         modelAttentionCapable: target === "cloud" || supportsModelAttention(scope),
       })) blocked = { code: access.code, message: access.message, occurredAt: Date.now() }
     }
     if (blocked) {
       const now = Date.now()
-      await automationRepository.markNeedsAttention({
+      // A desktop-only model blocks one run in the cloud, not the Automation's own schedule.
+      if (ownPlacement(current.revision, target)) await automationRepository.markNeedsAttention({
         automationId: current.automation.id,
         expectedRevisionId: current.revision.id,
         reason: { ...blocked, occurredAt: now },
         now,
       })
-      return automationRepository.recordSkippedManual({
+      const skipped = await automationRepository.recordSkippedManual({
         ...scope,
         automation: current.automation,
         revision,
@@ -434,7 +514,10 @@ export class AutomationService {
         message: blocked.message,
         now,
       })
+      await recordAutomationRunCompleted({ runId: skipped.id, terminalAt: now })
+      return skipped
     }
+    const claimedAt = Date.now()
     const claim = await automationRepository.claim({
       automation: { ...current.automation, state: "active" },
       revision,
@@ -444,8 +527,9 @@ export class AutomationService {
       leaseOwner: schedulerOwner,
       leaseMs: env.automations.leaseMs,
       claimDeadlineMs: AUTOMATION_MANUAL_CLAIM_WINDOW_MS,
-      now: Date.now(),
+      now: claimedAt,
     })
+    if (claim.kind === "overlap") await recordAutomationRunCompleted({ runId: claim.run.id, terminalAt: claimedAt })
     if (claim.kind === "claimed" && claim.run.executionTarget === "cloud") {
       this.startCloudRun(claim.run.id)
     }
@@ -456,19 +540,29 @@ export class AutomationService {
     return automationRepository.listRuns({ ...scope, automationId, cursor: input.cursor, limit: input.limit ?? 50 })
   }
 
+  listRunsInRange(scope: OwnerScope, input: { from: number; to: number; cursor?: string; limit?: number }) {
+    return automationRepository.listRunsInRange({ ...scope, from: input.from, to: input.to, cursor: input.cursor, limit: input.limit ?? 200 })
+  }
+
   getRun(scope: OwnerScope, runId: string) {
     return automationRepository.getRunReceipt({ ...scope, runId })
   }
 
   async cancelRun(scope: OwnerScope, runId: string): Promise<AutomationRun | null> {
-    return automationRepository.requestCancellation({ ...scope, runId, now: Date.now() })
+    const now = Date.now()
+    const run = await automationRepository.requestCancellation({ ...scope, runId, now })
+    // A queued run is cancelled right here; running ones finish through their executor.
+    if (run?.status === "cancelled") await recordAutomationRunCompleted({ runId: run.id, terminalAt: now, actor: { kind: "owner" } })
+    return run
   }
 
   async tick(input: { now?: number; batchSize?: number } = {}): Promise<string[]> {
     const now = input.now ?? Date.now()
     const started: string[] = []
-    await automationRepository.recoverExpiredLeases({ now, limit: input.batchSize ?? env.automations.batchSize })
-    await automationRepository.expireUnclaimedDesktop({ now, limit: input.batchSize ?? env.automations.batchSize })
+    const recovered = await automationRepository.recoverExpiredLeases({ now, limit: input.batchSize ?? env.automations.batchSize })
+    const expired = await automationRepository.expireUnclaimedDesktop({ now, limit: input.batchSize ?? env.automations.batchSize })
+    // Only runs that ran out of attempts became terminal at `now`; re-queued ones record nothing.
+    for (const runId of [...recovered.map((run) => run.id), ...expired]) await recordAutomationRunCompleted({ runId, terminalAt: now })
     await this.pruneRunnerState(now)
 
     const queuedCloud = await automationRepository.listQueuedCloud({ limit: input.batchSize ?? env.automations.batchSize })
@@ -480,55 +574,87 @@ export class AutomationService {
     for (const item of due) {
       const scheduledFor = item.automation.nextDueAt
       if (scheduledFor === null) continue
-      // Revalidate the owner's model access at dispatch time. The occurrence is
-      // still claimed either way so the schedule advances durably; a failed
-      // check becomes a skipped receipt instead of work for the runner.
-      const access = item.revision.action?.kind === "saved_script"
-        ? (await isActiveAutomationOwner(item.automation)
-            ? { ok: true as const }
-            : { ok: false as const, code: "owner_membership_lost" as const, message: "The Automation owner is no longer active." })
-        : await resolveAutomationModelAccess({
-            organizationId: item.automation.organizationId,
-            ownerMemberId: item.automation.ownerMemberId,
-            ...item.revision.model,
-          })
-      let claim: AutomationClaimResult
-      try {
-        claim = await automationRepository.claim({
-          automation: item.automation,
-          revision: item.revision,
-          trigger: "scheduled",
-          scheduledFor,
-          leaseOwner: schedulerOwner,
-          leaseMs: env.automations.leaseMs,
-          claimDeadlineMs: env.automations.runnerClaimDeadlineMs,
-          now,
-        })
-      } catch (error) {
-        if (error instanceof Error && error.message === "automation_not_active") continue
-        throw error
-      }
-      if (claim.kind !== "claimed") continue
-      if (!access.ok && shouldApplyAutomationModelAccessFailure({
-        model: item.revision.model,
-        failure: access,
-        // Scheduling must remain compatible until a capable desktop claims
-        // the work or a capable management client reconciles the Automation.
-        modelAttentionCapable: (item.revision.executionTarget ?? "desktop") === "cloud",
-      })) {
-        await automationRepository.skipRun({ runId: claim.run.id, code: access.code, message: access.message, now })
-        await automationRepository.markNeedsAttention({
-          automationId: item.automation.id,
-          expectedRevisionId: item.revision.id,
-          reason: { code: access.code, message: access.message, occurredAt: now },
-          now,
-        })
-        continue
-      }
-      started.push(claim.run.id)
-      if (claim.run.executionTarget === "cloud") this.startCloudRun(claim.run.id)
+      const runId = await this.claimAndDispatch(item, { scheduledFor }, now)
+      if (runId) started.push(runId)
+    }
+    // Meetings are another reason to run; a calendar that cannot be read never holds up the clock.
+    try {
+      started.push(...await this.calendarTriggers.tick(now))
+    } catch (error) {
+      logger.error("Calendar triggers failed", { error })
     }
     return started
+  }
+
+  /**
+   * Claims one occurrence and starts its run, or records why it was skipped.
+   * Returns the run id when work started. The occurrence is claimed even when
+   * a check fails, so the schedule advances durably and the person sees why.
+   */
+  private async claimAndDispatch(
+    item: AutomationListItem,
+    occurrence: { scheduledFor: number; nonce?: string; triggerContext?: AutomationRunTriggerContext },
+    now: number,
+  ): Promise<string | null> {
+    // Revalidate the owner's model access at dispatch time; a failed check
+    // becomes a skipped receipt instead of work for the runner.
+    const access = item.revision.action?.kind === "saved_script"
+      ? (await isActiveAutomationOwner(item.automation)
+          ? { ok: true as const }
+          : { ok: false as const, code: "owner_membership_lost" as const, message: "The Automation owner is no longer active." })
+      : await resolveAutomationModelAccess({
+          organizationId: item.automation.organizationId,
+          ownerMemberId: item.automation.ownerMemberId,
+          ...item.revision.model,
+          executionTarget: item.revision.executionTarget ?? "desktop",
+        })
+    let claim: AutomationClaimResult
+    try {
+      claim = await automationRepository.claim({
+        automation: item.automation,
+        revision: item.revision,
+        trigger: "scheduled",
+        scheduledFor: occurrence.scheduledFor,
+        ...(occurrence.nonce ? { nonce: occurrence.nonce } : {}),
+        ...(occurrence.triggerContext ? { triggerContext: occurrence.triggerContext } : {}),
+        leaseOwner: schedulerOwner,
+        leaseMs: env.automations.leaseMs,
+        claimDeadlineMs: env.automations.runnerClaimDeadlineMs,
+        now,
+      })
+    } catch (error) {
+      if (error instanceof Error && error.message === "automation_not_active") return null
+      throw error
+    }
+    // Scheduler-initiated work has no HTTP request: its start is service-layer evidence.
+    if (claim.kind !== "duplicate") await recordAutomationRunStarted(claim.run.id)
+    if (claim.kind === "overlap") await recordAutomationRunCompleted({ runId: claim.run.id, terminalAt: now })
+    if (claim.kind !== "claimed") return null
+    const target = item.revision.executionTarget ?? "desktop"
+    if (!await automationTargetAllowed(item.automation.organizationId, target)) {
+      // The organization turned this kind off: the occurrence is recorded as skipped and the schedule advances.
+      await this.skipRun({ runId: claim.run.id, code: "execution_runtime_unavailable", message: `${target === "cloud" ? "Cloud" : "Desktop"} Automations are turned off for this organization.`, now })
+      return null
+    }
+    if (!access.ok && shouldApplyAutomationModelAccessFailure({
+      model: item.revision.model,
+      failure: access,
+      executionTarget: item.revision.executionTarget ?? "desktop",
+      // Scheduling must remain compatible until a capable desktop claims
+      // the work or a capable management client reconciles the Automation.
+      modelAttentionCapable: (item.revision.executionTarget ?? "desktop") === "cloud",
+    })) {
+      await this.skipRun({ runId: claim.run.id, code: access.code, message: access.message, now })
+      await automationRepository.markNeedsAttention({
+        automationId: item.automation.id,
+        expectedRevisionId: item.revision.id,
+        reason: { code: access.code, message: access.message, occurredAt: now },
+        now,
+      })
+      return null
+    }
+    if (claim.run.executionTarget === "cloud") this.startCloudRun(claim.run.id)
+    return claim.run.id
   }
 
   async stop(): Promise<void> {
@@ -577,23 +703,26 @@ export class AutomationService {
     return { connected: desktopRunnerConnected({ lastSeenAt, now: Date.now() }), lastSeenAt }
   }
 
+  private async canRunScheduledAutomations(scope: DesktopRunnerScope) {
+    if (scope.capabilities?.includes(REMOTE_SESSION_ONLY_RUNNER_CAPABILITY)) return false
+    // A token issued before the registration changed must not restore scheduled
+    // execution to a session-only runner.
+    const registration = await automationRepository.desktopRunnerById(scope)
+    return !registration?.capabilities.includes(REMOTE_SESSION_ONLY_RUNNER_CAPABILITY)
+  }
+
+  /** The work route records the runner's presence before calling this. */
   async discoverDesktopRunnerWork(scope: DesktopRunnerScope) {
-    try {
-      await this.touchDesktopRunner(scope)
-    } catch (error) {
-      logger.warn("automation desktop runner touch failed", {
-        organization_id: scope.organizationId,
-        owner_member_id: scope.ownerMemberId,
-        runner_id: scope.runnerId,
-        error,
-      })
-    }
+    if (!await this.canRunScheduledAutomations(scope)) return []
+    if (!await automationTargetAllowed(scope.organizationId, "desktop")) return []
     // Every desktop sees all of the owner's queued runs and skips the ones
     // pinned to a workspace it lacks, so the window must reach past them.
     return automationRepository.discoverDesktopWork({ ...scope, now: Date.now(), limit: AUTOMATION_RUNNER_WORK_RUN_LIMIT })
   }
 
   async claimDesktopRunner(scope: DesktopRunnerScope, runId: string) {
+    if (!await this.canRunScheduledAutomations(scope)) return null
+    if (!await automationTargetAllowed(scope.organizationId, "desktop")) return null
     const claimed = await automationRepository.claimDesktop({
       organizationId: scope.organizationId,
       ownerMemberId: scope.ownerMemberId,
@@ -609,6 +738,7 @@ export class AutomationService {
       organizationId: scope.organizationId,
       ownerMemberId: scope.ownerMemberId,
       ...claimed.revision.model,
+      executionTarget: "desktop",
     })
     if (!access.ok && shouldApplyAutomationModelAccessFailure({
       model: claimed.revision.model,
@@ -616,7 +746,7 @@ export class AutomationService {
       modelAttentionCapable: supportsModelAttention(scope),
     })) {
       const now = Date.now()
-      await automationRepository.skipRun({
+      await this.skipRun({
         runId: claimed.run.id,
         code: access.code,
         message: access.message,
@@ -687,6 +817,8 @@ export class AutomationService {
       attempt: result.attempt,
       now,
     })
+    // A retried callback returns the stored terminal run (older finished_at): no second event.
+    await recordAutomationRunCompleted({ runId, terminalAt: now, actor: { kind: "runner", runnerId: scope.runnerId, ownerMemberId: scope.ownerMemberId } })
     // A Cloud Automation run once on a desktop that lacks its model says
     // nothing about the cloud, so only the Automation's own placement pauses.
     if ((result.error?.code === "model_access_lost" || result.error?.code === "provider_unavailable")
@@ -710,9 +842,9 @@ export class AutomationService {
   }
 
   /**
-   * New capable clients require current authority. Published clients may
-   * continue submitting the exact legacy Zen selection until they advertise
-   * support for the repairable attention state.
+   * Published Desktop admission remains compatible, including model-attention
+   * v1 clients. Cloud enforces provider filters here; updated Desktop runners
+   * check their effective workspace model catalog before creating a thread.
    */
   private async requireNewModel(scope: OwnerScope, model: ModelSelection, target: "desktop" | "cloud") {
     // The cloud default only means something where the runner picks the model.
@@ -722,10 +854,11 @@ export class AutomationService {
       error.name = "model_access_lost"
       throw error
     }
-    const result = await resolveAutomationModelAccess({ ...scope, ...model })
+    const result = await resolveAutomationModelAccess({ ...scope, ...model, executionTarget: target })
     if (!result.ok && shouldApplyAutomationModelAccessFailure({
       model,
       failure: result,
+      executionTarget: target,
       modelAttentionCapable: supportsModelAttention(scope),
     })) {
       const error = new Error(result.message)
@@ -741,6 +874,7 @@ export class AutomationService {
       organizationId: item.automation.organizationId,
       ownerMemberId: item.automation.ownerMemberId,
       ...item.revision.model,
+      executionTarget: item.revision.executionTarget ?? "desktop",
     }),
   ): Promise<AutomationListItem> {
     if (item.automation.state !== "active" || item.revision.action?.kind === "saved_script") return item
@@ -748,6 +882,7 @@ export class AutomationService {
     if (access.ok || !shouldApplyAutomationModelAccessFailure({
       model: item.revision.model,
       failure: access,
+      executionTarget: item.revision.executionTarget ?? "desktop",
       modelAttentionCapable: (item.revision.executionTarget ?? "desktop") === "cloud"
         || supportsModelAttention(scope),
     })) return item
@@ -765,10 +900,27 @@ export class AutomationService {
     }) ?? item
   }
 
+  /** completeCloud plus the run's single terminal audit outcome (only when this call made the transition). */
+  private async completeCloud(input: Parameters<typeof automationRepository.completeCloud>[0]) {
+    const completed = await automationRepository.completeCloud(input)
+    await recordAutomationRunCompleted({ runId: input.runId, terminalAt: input.now })
+    return completed
+  }
+
+  private async skipRun(input: Parameters<typeof automationRepository.skipRun>[0]) {
+    await automationRepository.skipRun(input)
+    await recordAutomationRunCompleted({ runId: input.runId, terminalAt: input.now })
+  }
+
   private async executeCloudRun(runId: string): Promise<void> {
     const leaseOwner = `${schedulerOwner}:cloud:${runId}`
     const target = await automationRepository.cloudRunTarget(runId)
     if (!target) return
+    // Every queued, recovered or manual cloud run passes here: once the organization turns Cloud off, none starts.
+    if (!await automationTargetAllowed(target.organizationId, "cloud")) {
+      await this.skipRun({ runId, code: "execution_runtime_unavailable", message: "Cloud Automations are turned off for this organization.", now: Date.now() })
+      return
+    }
     const runtime = await this.cloudRuntime(target.organizationId)
     // A run keeps the engine it started on, so recovery never switches runtimes mid-run.
     const engineKind = target.engineKind
@@ -793,7 +945,7 @@ export class AutomationService {
       : await this.getOpenWorkWebAccess(claimed.automation.organizationId)
     if (!webAccess.hasAccess) {
       const now = Date.now()
-      await automationRepository.skipRun({
+      await this.skipRun({
         runId: claimed.run.id,
         code: OPENWORK_WEB_ACCESS_REQUIRED_CODE,
         message: OPENWORK_WEB_ACCESS_REQUIRED_MESSAGE,
@@ -818,7 +970,7 @@ export class AutomationService {
     if (claimed.revision.action?.kind !== "saved_script") return
     const executor = cloudWorkflowExecutor
     if (!executor) {
-      await automationRepository.completeCloud({
+      await this.completeCloud({
         automationId: claimed.automation.id,
         runId,
         leaseOwner,
@@ -839,7 +991,7 @@ export class AutomationService {
       message: error instanceof Error ? error.message : "Workflow execution failed.",
       retryable: true,
     }))
-    await automationRepository.completeCloud({
+    await this.completeCloud({
       automationId: claimed.automation.id,
       runId,
       leaseOwner,
@@ -878,7 +1030,7 @@ export class AutomationService {
     if (action?.kind !== "agent") return
     const executor = engineKind === HEADLESS_AGENT_ENGINE_KIND ? headlessAgentExecutor : cloudAgentExecutor
     if (!executor) {
-      await automationRepository.completeCloud({
+      await this.completeCloud({
         automationId: claimed.automation.id,
         runId: claimed.run.id,
         leaseOwner,
@@ -912,7 +1064,7 @@ export class AutomationService {
     const heartbeatIntervalMs = Math.max(1_000, Math.min(10_000, Math.floor(env.automations.leaseMs / 3)))
     await monitor()
     if (controller.signal.aborted) {
-      await automationRepository.completeCloud({
+      await this.completeCloud({
         automationId: claimed.automation.id,
         runId: claimed.run.id,
         leaseOwner,
@@ -935,6 +1087,12 @@ export class AutomationService {
       })
     }, heartbeatIntervalMs)
     interval.unref()
+    // A calendar-triggered run is told which meeting started it, as data after the person's instructions.
+    const meeting = claimed.run.triggerContext
+    const schedule = claimed.revision.schedule
+    const runAction = meeting?.kind === "calendar_meeting" && schedule.kind === "calendar"
+      ? { ...action, instructions: calendarTriggerPrompt({ instructions: action.instructions, trigger: schedule, meeting }) }
+      : action
     let result: CloudAgentExecution
     try {
       const state = await automationRepository.cloudRunState(claimed.run.id)
@@ -943,7 +1101,7 @@ export class AutomationService {
         ownerMemberId: claimed.automation.ownerMemberId,
         automationRunId: claimed.run.id,
         automationName: claimed.automation.name,
-        action,
+        action: runAction,
         maximumRuntimeMs: claimed.revision.maximumRuntimeMs,
         previousReceipt: state?.receipt ?? null,
         workspaceId: runWorkspaceId(claimed.revision, "cloud"),
@@ -993,7 +1151,7 @@ export class AutomationService {
       })
     }
 
-    await automationRepository.completeCloud({
+    await this.completeCloud({
       automationId: claimed.automation.id,
       runId: claimed.run.id,
       leaseOwner,

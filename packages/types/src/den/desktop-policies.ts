@@ -90,11 +90,13 @@ export const desktopPolicyDefinitions = [
   },
   {
     id: "allowZenModel",
-    teamLabel: "Use OpenCode models",
+    // Historical key name. OpenCode Zen is retired in every OpenWork app
+    // regardless of this value; it now only controls the free Auto model.
+    teamLabel: "Use the free starter model",
     group: "ai",
-    name: "Enable OpenCode Zen Models",
-    description: "Allow users to use the built in models provided by OpenCode.",
-    userNotice: "Your administrator has disabled access to OpenCode Models.",
+    name: "Free starter model (Auto)",
+    description: "Allow users to use OpenWork's free, rate-limited Auto model. OpenCode Zen models are retired and never offered.",
+    userNotice: "Your administrator has turned off the free starter model.",
     defaultValue: true,
     restrictedValue: false,
   },
@@ -371,6 +373,51 @@ export const brandAccentColorValues = [
 
 export type BrandAccentColor = (typeof brandAccentColorValues)[number];
 
+/**
+ * The member's agent permissions as ordered OpenCode permission rules, last
+ * match wins. ./agent-permissions.ts owns the catalog and checks each rule
+ * strictly where it is enforced; a value import from it here would break the
+ * Den web build, which cannot resolve relative `.js` imports.
+ */
+export const desktopAgentPermissionsSchema = z
+  .object({
+    rules: z
+      .array(
+        z.object({
+          action: z.string().min(1).max(64),
+          resource: z.string().min(1).max(500),
+          effect: z.enum(["allow", "ask", "deny"]),
+          source: z.string().min(1).max(255),
+        }),
+      )
+      .max(2_000),
+  })
+  .meta({ ref: "DenDesktopAgentPermissions" });
+
+export type DesktopAgentPermissionRule = z.infer<typeof desktopAgentPermissionsSchema>["rules"][number];
+
+/**
+ * The model new desktop chats start with on the OpenCode v2 engine, chosen by
+ * the organization or one of the member's teams.
+ * Mirrors `desktopDefaultModelSchema` in ./default-model.ts, which owns the
+ * resolution rules; kept inline for the same reason as agent permissions.
+ */
+export const desktopConfigDefaultModelSchema = z
+  .object({
+    providerID: z.string().min(1).max(128),
+    modelID: z.string().min(1).max(255),
+    source: z.enum(["team", "organization"]),
+    teamName: z.string().max(255).optional(),
+  })
+  .meta({ ref: "DenDesktopConfigDefaultModel" });
+
+/** Verified account scope for browser upload consent; never inferred from cached tokens. */
+export const desktopBrowserUploadPermissionsSchema = z.object({
+  enabled: z.boolean(),
+  organizationId: z.string().min(1).max(255),
+  memberId: z.string().min(1).max(255),
+}).meta({ ref: "DenDesktopBrowserUploadPermissions" });
+
 export const desktopConfigSchema = desktopPolicyValueSchema
   .extend({
     execution: effectiveDesktopExecutionPolicySchema.optional(),
@@ -382,10 +429,26 @@ export const desktopConfigSchema = desktopPolicyValueSchema
     brandIconUrl: z.string().url().max(2048).optional(),
     brandAccentColor: z.enum(brandAccentColorValues).optional(),
     automationsEnabled: z.boolean().optional(),
+    /** This desktop may run the member's Desktop Automations. Missing means: follow automationsEnabled. */
+    desktopAutomationsEnabled: z.boolean().optional(),
+    /** The organization can create Cloud Automations. Missing means: ask the execution target list. */
+    cloudAutomationsEnabled: z.boolean().optional(),
     dashboardEnabled: z.boolean().optional(),
     connectEnabled: z.boolean().optional(),
+    /** The opencodeV2Only rollout: OpenCode v2 serves every chat and switching to v1 is off. Missing means off. */
+    opencodeV2Only: z.boolean().optional(),
+    /** Compatibility for older clients: true. Current hosts always mirror personal API keys into OpenCode v2. */
+    localProviderMirror: z.boolean().optional(),
+    /** Compatibility for older clients: true. Current clients always remove retired OpenCode Zen models. */
+    removeOpencodeZen: z.boolean().optional(),
     onboardingPrompts: onboardingPromptsSchema.optional(),
     onboardingPromptDescriptions: onboardingPromptDescriptionsSchema.optional(),
+    /** The member's agent permissions, present when the organization has them on. */
+    agentPermissions: desktopAgentPermissionsSchema.optional(),
+    /** Present only for clients supporting browser upload permissions. */
+    browserUploadPermissions: desktopBrowserUploadPermissionsSchema.optional(),
+    /** The member's default model for new chats, present when the organization has one and the feature is on. */
+    defaultModel: desktopConfigDefaultModelSchema.optional(),
   })
   .meta({ ref: "DenDesktopConfig" });
 
@@ -778,6 +841,9 @@ export function normalizeDesktopConfig(value: unknown): DesktopConfig {
     typeof raw?.connectEnabled === "boolean" ? raw.connectEnabled : undefined;
   const onboardingPromptConfig = normalizeOnboardingPromptConfig(raw);
   const execution = raw?.execution === undefined ? undefined : effectiveDesktopExecutionPolicySchema.parse(raw.execution);
+  const agentPermissions = desktopAgentPermissionsSchema.safeParse(raw?.agentPermissions);
+  const browserUploadPermissions = desktopBrowserUploadPermissionsSchema.safeParse(raw?.browserUploadPermissions);
+  const defaultModel = desktopConfigDefaultModelSchema.safeParse(raw?.defaultModel);
 
   return {
     ...policy,
@@ -788,17 +854,31 @@ export function normalizeDesktopConfig(value: unknown): DesktopConfig {
     ...(brandIconUrl !== undefined ? { brandIconUrl } : {}),
     ...(brandAccentColor !== undefined ? { brandAccentColor } : {}),
     ...(automationsEnabled !== undefined ? { automationsEnabled } : {}),
+    ...(typeof raw?.desktopAutomationsEnabled === "boolean" ? { desktopAutomationsEnabled: raw.desktopAutomationsEnabled } : {}),
+    ...(typeof raw?.cloudAutomationsEnabled === "boolean" ? { cloudAutomationsEnabled: raw.cloudAutomationsEnabled } : {}),
     ...(dashboardEnabled !== undefined ? { dashboardEnabled } : {}),
     ...(connectEnabled !== undefined ? { connectEnabled } : {}),
+    ...(typeof raw?.opencodeV2Only === "boolean" ? { opencodeV2Only: raw.opencodeV2Only } : {}),
+    ...(typeof raw?.localProviderMirror === "boolean" ? { localProviderMirror: raw.localProviderMirror } : {}),
+    ...(typeof raw?.removeOpencodeZen === "boolean" ? { removeOpencodeZen: raw.removeOpencodeZen } : {}),
     ...(onboardingPromptConfig !== undefined ? onboardingPromptConfig : {}),
+    ...(agentPermissions.success ? { agentPermissions: agentPermissions.data } : {}),
+    ...(browserUploadPermissions.success ? { browserUploadPermissions: browserUploadPermissions.data } : {}),
+    ...(defaultModel.success ? { defaultModel: defaultModel.data } : {}),
   };
 }
 
-/** Role assignments include built-in parent roles; custom members still match the member assignment. */
-export function matchingDesktopPolicyAssignmentRoles(memberRole: string) {
-  const levels = new Map<string, number>([["owner", 3], ["super-admin", 2], ["admin", 1], ["member", 0]]);
+/**
+ * Role assignments a member matches. Assignments include built-in parent
+ * roles (an owner also matches `admin`), every member matches `member`, and
+ * `admin` matches effective admins: a direct admin role or membership of a
+ * team that grants organization admin (`adminViaTeam`).
+ */
+export function matchingDesktopPolicyAssignmentRoles(memberRole: string, options: { adminViaTeam?: boolean } = {}) {
+  const levels = new Map<string, number>([["owner", 2], ["admin", 1], ["member", 0]]);
   const roles = memberRole.split(",").map((role) => role.trim()).filter(Boolean);
-  return (["owner", "admin", "member"] as const).filter((required) => roles.some((role) =>
-    required === "member" || (levels.get(role) ?? -1) >= (levels.get(required) ?? 0),
+  if (options.adminViaTeam) roles.push("admin");
+  return (["owner", "admin", "member"] as const).filter((required) => required === "member" || roles.some((role) =>
+    (levels.get(role) ?? -1) >= (levels.get(required) ?? 0),
   ));
 }

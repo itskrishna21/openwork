@@ -22,6 +22,22 @@ The app consumes OpenWork server surfaces (self-hosted or hosted) rather than
 inventing parallel behavior. Anything OpenCode can do is available in OpenWork,
 even before a dedicated UI exists.
 
+OpenCode v2 is the default. Hosts select v2 when idle; vanilla upstream OpenCode
+owns in-place history migration on startup. Keep populated legacy separate v2
+stores readable; never revive OpenWork's retired history-copy worker or locks.
+Respect explicit manual engine choices and local support/test overrides; never
+restore the retired `engineV2ForceUpgrade` gate. See `docs/opencode-engine-migration.md`.
+
+Customer-cloud managed installation architecture lives in
+`infra/managed-deployments/README.md` and `docs/managed-deployments.md`. AWS
+uses CloudFormation/CodeBuild; GCP uses customer-approved Cloud Shell and
+impersonated Terraform behind `managedDeployments` (cloud only, off), the same
+switch as AWS and the deployment agent tools.
+Installer publication/configuration is an operator action, not CLI sign-in or a
+feature rollout. Never fake readiness; local tests do not prove a live install.
+Killing a rollout blocks launches without deleting customer resources or
+interrupting authenticated enrollment/health reports.
+
 ## Confidentiality (hard rule — this repo is public)
 
 Never let a branch name, commit, PR text, comment, fixture, or evidence identify
@@ -30,16 +46,22 @@ escalate any leak instead of rewriting history.
 
 ## Generated API contracts
 
-After changing Den routes or their shared schemas, run `pnpm den:contract` and
-include `packages/docs/openapi.json` and `packages/sdk/src/gen/**` in the same
-commit. The command builds once and generates both outputs from one snapshot.
-After merging/rebasing `dev`, regenerate rather than choosing ours/theirs for
-conflicted generated files. Never hand-edit them or regenerate a Drizzle migration
-snapshot to resolve an API conflict.
+Den route metadata and shared schemas are the source of truth. OpenAPI and
+`packages/sdk/src/gen/**` are ignored build artifacts: never commit or hand-edit
+them. CI generates, lints and typechecks them from the PR source and uploads
+an artifact. Hosted docs read the normalized deployed contract at
+`/openapi.json?public=1`; the raw `/openapi.json` remains available.
 
-Optional: `pnpm hooks:install` enables a pre-commit hook that skips unrelated
-commits and regenerates/stages only contract outputs for API changes. It refuses
-unstaged/untracked contract inputs or outputs, so finish partial staging first.
+`pnpm sdk:build` and SDK typechecks generate missing or stale artifacts first.
+`pnpm den:contract` forces a clean generation and prepares/removes a disposable
+local MySQL database. Start MySQL with `pnpm dev:den:mysql`; only
+`OPENWORK_CONTRACT_MYSQL_URL` can select alternate localhost credentials.
+`DATABASE_URL` is never used for generation. After a merge/rebase regenerate
+locally when needed; generated files do not enter the merge. Never regenerate
+a Drizzle migration snapshot to resolve an API conflict.
+
+Optional: `pnpm hooks:install` enables source validation before commits. It
+refuses unstaged/untracked contract inputs and never stages generated outputs.
 Hooks never commit, push, or change CI/Warden policy; CI remains authoritative.
 
 ## Coding
@@ -48,12 +70,30 @@ Hooks never commit, push, or change CI/Warden policy; CI remains authoritative.
   100% necessary or instructed.
 * Prefer Tailwind, React, shadcn/ui (Base UI), TanStack Query, Zustand, Zod,
   Drizzle, Better-Auth. Reuse `@/components`; end users are non-technical.
-* New feature or a change users would notice? Declare it, off, in
-  `packages/features/src/registry.ts` before writing the code, make it safe
-  to turn off, then roll it out from `/admin`. Follow
+* Put any change to product behavior that users can see behind a feature
+  flag, so it can be turned off without a deploy: new or changed flows,
+  screens, options and defaults. Ship directly only what users won't notice
+  as a behavior change: fixes that restore intended behavior, polish,
+  refactors, tests and `/admin` tooling. When unsure, flag. Follow
   `.opencode/skills/add-a-feature`.
 * Any user-facing UI (desktop app, Den web, MCP Apps, artifact views) follows
   `DESIGN.md`: read it before designing, cite its rule ids in PRs, and attach
   screenshots of new UI. The optional
   `.warden/skills/design-spec-review` skill can review these rules locally.
+
+## Verify changes headless
+
+Launching the desktop app on a developer's computer opens a window that takes
+focus. Check app UI in headless Chrome instead:
+
+* Specs: `seed.appWeb` (`write-a-spec`); `run-tests` explains which placement
+  tests your working tree.
+* By hand: `pnpm world up dev-app-web --detach -- --browser`, then drive the
+  printed `cdp` address (`drive-desktop-cdp`).
+* Use the desktop app (`seed.desktop`, `pnpm dev`, `preview-desktop`,
+  `live-desktop`) only when the user asks or the change needs the desktop
+  shell: titlebar and window controls, native menus and dialogs, `openwork://`
+  links and OAuth hand-off, the built-in browser pane, updater, quit and
+  relaunch, or packaged builds. Prefer `--daytona` for those so the window
+  opens in a sandbox; Daytona builds a pushed commit, not your working tree.
 

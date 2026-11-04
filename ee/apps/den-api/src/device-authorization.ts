@@ -13,15 +13,10 @@ import { db } from "./db.js"
  * otherwise get a session with no active organization.
  */
 
-/** The only client ids allowed to start a device login. */
-export const DEN_DEVICE_CLIENT_IDS = ["openwork-cli"] as const
+export { DEN_DEVICE_CLIENT_IDS, DEN_OPENCODE_PLUGIN_DEVICE_CLIENT_ID, isDenDeviceClientId } from "./device-clients.js"
 
 export const DEN_DEVICE_CODE_EXPIRES_IN = "15m"
 export const DEN_DEVICE_CODE_POLL_INTERVAL = "5s"
-
-export function isDenDeviceClientId(clientId: string): boolean {
-  return DEN_DEVICE_CLIENT_IDS.some((allowed) => allowed === clientId)
-}
 
 /** Strip the display separator so "ABCD-EFGH" and "abcdefgh" match the stored code. */
 export function normalizeDeviceUserCode(userCode: string): string {
@@ -36,7 +31,8 @@ type PendingDeviceOrganization = { userId: string; organizationId: string }
 const pendingDeviceOrganizations = new Map<string, PendingDeviceOrganization>()
 
 export async function stageDeviceSessionOrganization(deviceCode: string): Promise<void> {
-  const [row] = await db
+  // primary: the CLI's poll can arrive right after approval.
+  const [row] = await db.$primary
     .select({
       status: DeviceCodeTable.status,
       userId: DeviceCodeTable.userId,
@@ -56,7 +52,12 @@ export function clearDeviceSessionOrganization(deviceCode: string): void {
 }
 
 async function isActiveMember(input: { userId: string; organizationId: string }): Promise<boolean> {
-  const [member] = await db
+  return (await activeMemberId(input)) !== null
+}
+
+async function activeMemberId(input: { userId: string; organizationId: string }): Promise<string | null> {
+  // primary: a person removed moments ago must not land in the organization.
+  const [member] = await db.$primary
     .select({ id: MemberTable.id })
     .from(MemberTable)
     .where(and(
@@ -65,7 +66,7 @@ async function isActiveMember(input: { userId: string; organizationId: string })
       isNull(MemberTable.removedAt),
     ))
     .limit(1)
-  return Boolean(member)
+  return member?.id ?? null
 }
 
 /**
@@ -88,7 +89,8 @@ export type DeviceCodeLookup =
 
 /** What the verification page shows before the person decides. Never exposes the device code. */
 export async function lookupDeviceUserCode(userCode: string, now = new Date()): Promise<DeviceCodeLookup> {
-  const [row] = await db
+  // primary: the code is usually opened right after the CLI created it.
+  const [row] = await db.$primary
     .select({ status: DeviceCodeTable.status, clientId: DeviceCodeTable.clientId, expiresAt: DeviceCodeTable.expiresAt })
     .from(DeviceCodeTable)
     .where(eq(DeviceCodeTable.userCode, normalizeDeviceUserCode(userCode)))
@@ -102,6 +104,7 @@ export async function lookupDeviceUserCode(userCode: string, now = new Date()): 
 export type DeviceDecisionResult =
   | { ok: true; status: "approved" | "denied" }
   | { ok: false; status: 403 | 404 | 409; error: "not_a_member" | "invalid_user_code" | "already_decided"; message: string }
+  | { ok: false; response: Response }
 
 /**
  * Approve or deny a pending code for the signed-in person. Approval binds the
@@ -115,16 +118,21 @@ export async function decideDeviceUserCode(input: {
   decision: "approve" | "deny"
   organizationId?: string | null
   now?: Date
+  /** Runs once the chosen organization's active membership is verified, before any write; a Response refuses the decision. */
+  beforeEffect?: (membership: { organizationId: string; memberId: string; userId: string }) => Promise<Response | null>
 }): Promise<DeviceDecisionResult> {
   const now = input.now ?? new Date()
   const userId = normalizeDenTypeId("user", input.userId)
   const organizationId = input.decision === "approve" && input.organizationId
     ? normalizeDenTypeId("organization", input.organizationId)
     : null
-  if (organizationId && !await isActiveMember({ userId, organizationId })) {
-    return { ok: false, status: 403, error: "not_a_member", message: "You are not a member of that organization." }
+  if (organizationId) {
+    const memberId = await activeMemberId({ userId, organizationId })
+    if (!memberId) return { ok: false, status: 403, error: "not_a_member", message: "You are not a member of that organization." }
+    const blocked = input.beforeEffect ? await input.beforeEffect({ organizationId, memberId, userId }) : null
+    if (blocked) return { ok: false, response: blocked }
   }
-  const [row] = await db
+  const [row] = await db.$primary
     .select({ id: DeviceCodeTable.id, status: DeviceCodeTable.status, userId: DeviceCodeTable.userId, expiresAt: DeviceCodeTable.expiresAt })
     .from(DeviceCodeTable)
     .where(eq(DeviceCodeTable.userCode, normalizeDeviceUserCode(input.userCode)))

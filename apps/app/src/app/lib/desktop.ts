@@ -1,3 +1,4 @@
+import type { DesktopAgentPermissionRule } from "@openwork/types/den/desktop-policies";
 import { nativeDeepLinkEvent } from "./deep-link-bridge";
 
 export type * from "./desktop-types";
@@ -11,6 +12,7 @@ export type {
   OpencodeCommandDraft,
   WorkspaceOpenworkConfig,
   AppBuildInfo,
+  DesktopStartupTimings,
   DesktopDistributionInfo,
   BrandIconApplyResult,
   BrandIconState,
@@ -46,12 +48,16 @@ import type {
   WorkspaceList,
 } from "./desktop-types";
 import type {
+  AgentViewportKey,
   BrowserPanelOwnerPayload,
   BrowserPanelTab,
   BrowserStatePayload,
   OpenBrowserUrlResult,
 } from "@openwork/browser-tabs";
+import type { ComputerRequest } from "@openwork/types/desktop-ipc";
 export type { BrowserStatePayload } from "@openwork/browser-tabs";
+
+export type BrowserPresentationMode = "hidden" | "floating" | "side" | "fullscreen";
 
 export type BrowserProxyState = {
   proxy: { rules: string; authenticated: boolean } | null;
@@ -70,6 +76,11 @@ export type RecoveryActionResult = {
   reason?: string;
 };
 
+export type SpeechDictationEvent =
+  | { id: string; type: "ready" | "end" }
+  | { id: string; type: "result"; segments: string[] }
+  | { id: string; type: "error"; code: string };
+
 // ---------------------------------------------------------------------------
 // Electron bridge surface
 // ---------------------------------------------------------------------------
@@ -85,6 +96,16 @@ declare global {
         command: C,
         ...args: DesktopCommandArgs<C>
       ) => Promise<DesktopCommandResult<C>>;
+      sessionPins?: {
+        read: () => { ok: true; pins: string[] | null } | { ok: false; error: string };
+        update: (change: { previous: string[]; next: string[] }) => { ok: true; pins: string[] } | { ok: false; error: string };
+      };
+      computer?: {
+        onRequest?: (callback: (payload: { sessionId: string; request: ComputerRequest | null }) => void) => () => void;
+      };
+      dictation?: {
+        onEvent?: (callback: (payload: SpeechDictationEvent) => void) => () => void;
+      };
       automationRunner?: {
         onCredentialRejected?: (callback: () => void) => () => void;
       };
@@ -92,7 +113,7 @@ declare global {
         getPathForFile?: (file: File) => string;
       };
       shell?: {
-        openExternal?: (url: string) => Promise<{ ok: boolean; error?: string } | void>;
+        openExternal?: (url: string) => Promise<{ ok: boolean; pending?: boolean; error?: string } | void>;
         relaunch?: () => Promise<void>;
       };
       system?: {
@@ -182,6 +203,13 @@ declare global {
           options?: { sessionId?: string | null },
         ) => Promise<OpenBrowserUrlResult>;
         setVisibleSession?: (sessionId: string | null) => Promise<string | null>;
+        /** Tells the host how the visible conversation shows its browser, so Escape inside a full-screen page can leave full screen. */
+        setPresentation?: (sessionId: string | null, mode: BrowserPresentationMode) => Promise<boolean>;
+        /** A small JPEG preview of the visible conversation's on-screen tab, or null when none may be captured. */
+        /** Brings the popped-out browser window to the front. Only for the person's own action. */
+        focusWindow?: () => Promise<boolean>;
+        /** A new thread's first message made it this session: its browser tabs become the session's. */
+        claimDraftTabs?: (sessionId: string) => Promise<boolean>;
         navigate?: (url: string) => Promise<void>;
         back?: () => Promise<void>;
         forward?: () => Promise<void>;
@@ -197,19 +225,26 @@ declare global {
         closeSessionTabs?: (sessionId: string) => Promise<string[]>;
         selectTab?: (tabId: string) => Promise<string>;
         reorderTabs?: (tabIds: string[]) => Promise<BrowserPanelTab[]>;
-        approve?: (tabId: string, approvalId: string, allowed: boolean) => Promise<boolean>;
         taskControl?: (tabId: string, action: "pause" | "resume") => Promise<void>;
         listTabs?: () => Promise<BrowserPanelTab[]>;
-        listWebMcpTools?: (args?: { tabId?: string }) => Promise<unknown>;
-        executeWebMcpTool?: (args: { toolId: string; input?: unknown }) => Promise<unknown>;
         setProxy?: (proxy?: string | null) => Promise<BrowserProxyState>;
         getProxy?: () => Promise<BrowserProxyState>;
         setControlEnabled?: (enabled: boolean) => Promise<boolean>;
+        /** The size tabs lay out at while the agent controls them, drawn scaled to fit the panel. */
+        setAgentViewport?: (key: AgentViewportKey) => Promise<AgentViewportKey>;
+        /** The conversation started a new turn: tabs the person took over go back to the agent. */
+        startAgentTurn?: (sessionId: string) => Promise<boolean>;
+        /** The conversation's turn ended: its tabs fit the panel again. */
+        endAgentTurn?: (sessionId: string) => Promise<boolean>;
+        /** The member's agent permission rules for websites, applied to every page the built-in browser opens; null while they are being verified for an organization that uses them, which opens none. */
+        setAgentPermissionRules?: (rules: DesktopAgentPermissionRule[] | null) => Promise<boolean>;
         showTabContextMenu?: (tabId: string, point?: { x: number; y: number }) => Promise<void>;
         destroy?: () => Promise<void>;
         onStateChange?: (callback: (state: BrowserStatePayload) => void) => () => void;
         onPanelOpened?: (callback: (payload?: BrowserPanelOwnerPayload) => void) => () => void;
         onPanelClosed?: (callback: (payload?: BrowserPanelOwnerPayload) => void) => () => void;
+        /** Escape was pressed inside the page of a conversation shown full screen. */
+        onPresentationExit?: (callback: (payload: { sessionId: string | null; tabId: string }) => void) => () => void;
       };
       terminal?: {
         create?: (options: { cwd: string; cols: number; rows: number }) => Promise<{ terminalId: string }>;
@@ -487,18 +522,41 @@ export function assertDesktopWebUrl(url: string): string {
   return parsed.toString();
 }
 
-export async function openDesktopUrl(url: string): Promise<void> {
+/**
+ * "opening" means the system browser was asked and has not confirmed yet. Slow
+ * machines (virtual desktops, endpoint security) can take a minute to show it;
+ * that is not a failure, and asking again would only add another tab.
+ */
+export type DesktopUrlOpenStatus = "opened" | "opening";
+
+export async function openDesktopUrlWithStatus(url: string): Promise<DesktopUrlOpenStatus> {
   const safeUrl = assertDesktopWebUrl(url);
   const openExternal = window.__OPENWORK_ELECTRON__?.shell?.openExternal;
   if (openExternal) {
     const result = await openExternal(safeUrl);
     if (result && result.ok === false) {
+      if (result.pending) return "opening";
       throw new Error(result.error ?? "Failed to open browser");
     }
-    return;
+    return "opened";
   }
   if (typeof window !== "undefined") {
     window.open(safeUrl, "_blank", "noopener,noreferrer");
+  }
+  return "opened";
+}
+
+export async function openDesktopUrl(url: string): Promise<void> {
+  await openDesktopUrlWithStatus(url);
+}
+
+/** Read-only native probe for chat file candidates; never opens or reveals the item. */
+export async function resolveDesktopChatFilePath(target: string): Promise<string | null> {
+  if (typeof window === "undefined" || !window.__OPENWORK_ELECTRON__?.invokeDesktop) return null;
+  try {
+    return await invokeElectronHelper("__resolveChatFilePath", target);
+  } catch {
+    return null;
   }
 }
 
@@ -514,8 +572,8 @@ export async function openDesktopPath(target: string): Promise<void> {
  * the path on disk and launches only a real file inside the real workspace; a path that
  * resolves outside (for example through a symlink) is revealed in its folder instead.
  */
-export async function openDesktopWorkspaceFile(workspaceRoot: string, target: string): Promise<"opened" | "revealed"> {
-  const result = await invokeElectronHelper("__openWorkspaceFile", workspaceRoot, target);
+export async function openDesktopWorkspaceFile(workspaceRoot: string, target: string, options?: { reveal?: boolean }): Promise<"opened" | "revealed" | "unavailable"> {
+  const result = await invokeElectronHelper("__openWorkspaceFile", workspaceRoot, target, options);
   if (!result || typeof result !== "object" || !("ok" in result)) {
     throw new Error("Could not open this file.");
   }
@@ -577,6 +635,20 @@ export async function relaunchDesktopApp(): Promise<void> {
 
 export async function getDesktopHomeDir(): Promise<string> {
   return invokeElectronHelper("__homeDir");
+}
+
+let cachedHomeDir: Promise<string | null> | null = null;
+
+/** The home folder for expanding `~/` in chat file links; null outside the desktop app. */
+export function getCachedDesktopHomeDir(): Promise<string | null> {
+  if (typeof window === "undefined" || !window.__OPENWORK_ELECTRON__?.invokeDesktop) return Promise.resolve(null);
+  cachedHomeDir ??= getDesktopHomeDir()
+    .then((home) => (typeof home === "string" && home.trim() ? home : null))
+    .catch(() => {
+      cachedHomeDir = null;
+      return null;
+    });
+  return cachedHomeDir;
 }
 
 export async function joinDesktopPath(...parts: string[]): Promise<string> {
@@ -641,6 +713,7 @@ const {
   engineStop,
   engineRestart,
   appBuildInfo,
+  startupTimings,
   getDesktopBootstrapConfig,
   debugDesktopBootstrapConfig,
   clearDesktopBootstrapConfig,
@@ -652,6 +725,7 @@ const {
   openworkServerInfo,
   openworkServerRestart,
   runtimeBootstrap,
+  runtimeStatus,
   engineInfo,
   pickDirectory,
   pickFile,
@@ -681,6 +755,7 @@ export {
   engineStop,
   engineRestart,
   appBuildInfo,
+  startupTimings,
   getDesktopBootstrapConfig,
   debugDesktopBootstrapConfig,
   clearDesktopBootstrapConfig,
@@ -692,6 +767,7 @@ export {
   openworkServerInfo,
   openworkServerRestart,
   runtimeBootstrap,
+  runtimeStatus,
   engineInfo,
   pickDirectory,
   pickFile,

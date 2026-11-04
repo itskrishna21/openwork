@@ -2,21 +2,22 @@
 
 import { ChevronDown, Lock } from "lucide-react";
 import { useRouter } from "next/navigation";
-import { type ReactNode, useState } from "react";
+import { type ReactNode, useRef, useState } from "react";
 import { DenButton } from "../../_components/ui/button";
-import { getMcpConnectionsRoute, getToolTesterRoute } from "../../_lib/den-org";
+import { getLibraryConnectorRoute, getMcpConnectionRoute, getMcpConnectionsRoute, getOrgAccessFlags, getToolTesterRoute, permissionLockReason } from "../../_lib/den-org";
 import { useDenFlow } from "../../_providers/den-flow-provider";
 import { useOrgDashboard } from "../_providers/org-dashboard-provider";
 import { type AccessDraft, accessAddedToast } from "./access-summary";
 import { signInSentence } from "./admin-connectors";
 import { connectorAccountReady } from "./connector-detail";
+import { assignedConnectorForLibrary, personalConnectorDisconnectLabel } from "./connector-library-navigation";
 import { ChatButton, WhatYourAiCanDo } from "./connector-page-screen";
 import { GOOGLE_WORKSPACE_QUICK_ADD_ID, isNativeProviderCatalogId, MICROSOFT_365_QUICK_ADD_ID } from "./connector-catalog";
 import { useMemberSignIn } from "./connector-setup";
 import { ConnectorSettingsForm } from "./connector-settings";
 import { useDenToast } from "./den-toast";
 import { ItemHeader, ItemPage, SectionTitle } from "./item-header";
-import { DetailRows, ItemMenu, removeEntry, ItemPanel } from "./item-list";
+import { ConfirmDialog, DetailRows, ItemMenu, removeEntry, ItemPanel, LinkButton } from "./item-list";
 import { ConnectorLogo } from "./item-logo";
 import { useSaveConnectionAccess } from "./item-sharing";
 import { connectionMcpSetupUrl } from "./mcp-connection-app-setup";
@@ -25,6 +26,8 @@ import {
   isNativeProviderConnectionId,
   useDeleteMcpConnection,
   useDisconnectMcpConnection,
+  useDisconnectMyProviderAccount,
+  useMcpConnections,
   useMcpConnectionTools,
   useUpdateMcpConnection,
 } from "./mcp-connections-data";
@@ -32,7 +35,7 @@ import { NativeProviderSettings } from "./native-provider-setup";
 import { SlackAssistantSetup } from "./slack-assistant-setup";
 import { WhoCanUseIt } from "./who-can-use-it";
 
-function UseInAnotherApp({ connection }: { connection: ExternalMcpConnection }) {
+function UseInAnotherApp({ connection, lockedReason }: { connection: ExternalMcpConnection; lockedReason: string | null }) {
   const { runtimeConfig, runtimeConfigLoaded } = useDenFlow();
   const updateConnection = useUpdateMcpConnection();
   const [open, setOpen] = useState(false);
@@ -92,9 +95,12 @@ function UseInAnotherApp({ connection }: { connection: ExternalMcpConnection }) 
           ) : (
             <div className="flex items-center justify-between gap-4">
               <p>Let people add {connection.name} to Claude, Cursor or any MCP app.</p>
-              <DenButton variant="secondary" size="sm" loading={updateConnection.isPending} onClick={() => void turnOn()}>Turn on</DenButton>
+              <DenButton variant="secondary" size="sm" loading={updateConnection.isPending} disabled={lockedReason !== null} onClick={() => void turnOn()}>Turn on</DenButton>
             </div>
           )}
+          {!connection.exposeDirectly && lockedReason ? (
+            <p className="flex items-center gap-1.5"><Lock className="h-3.5 w-3.5 shrink-0" strokeWidth={1.5} aria-hidden />{lockedReason}</p>
+          ) : null}
           {error ? <p className="text-red-600" role="alert">{error}</p> : null}
         </div>
       ) : null}
@@ -126,11 +132,24 @@ function nativeKeyFor(connection: ExternalMcpConnection) {
   return isNativeProviderCatalogId(key) ? key : null;
 }
 
-/** C6: a connector in Manage, with Who can use it inline instead of Share. */
-export function AdminConnectorPageScreen({ connection }: { connection: ExternalMcpConnection }) {
+/** C6: a connector in Manage. `confirmRemove` (an agent's removal link) opens its Remove confirmation. */
+export function AdminConnectorPageScreen({ connection, confirmRemove = false }: { connection: ExternalMcpConnection; confirmRemove?: boolean }) {
   const router = useRouter();
   const toast = useDenToast();
   const { orgSlug, orgContext } = useOrgDashboard();
+  const usable = useMcpConnections("usable");
+  const assignedConnection = assignedConnectorForLibrary( connection.id, usable.data);
+  const personalDisconnectLabel = personalConnectorDisconnectLabel(assignedConnection);
+  const disconnectMyAccount = useDisconnectMyProviderAccount();
+  const memberAccess = orgContext
+    ? getOrgAccessFlags(orgContext.currentMember.role, orgContext.currentMember.isOwner, orgContext.currentMember.permissions)
+    : null;
+  const canShareWithEveryone = memberAccess?.canShareWithEveryone === true;
+  // People can always edit and remove connections they added.
+  const editLockedReason = memberAccess?.canEditAnyConnection || connection.createdByYou ? null : permissionLockReason("connections.update");
+  // Prefer the server's answer: it comes with the connection, so it stays current
+  // when permissions change while Den is open. The org context is loaded once.
+  const canRemove = connection.canRemove ?? (memberAccess?.canRemoveAnyConnection === true || connection.createdByYou === true);
   const saveAccess = useSaveConnectionAccess();
   const deleteConnection = useDeleteMcpConnection();
   const disconnect = useDisconnectMcpConnection();
@@ -140,6 +159,8 @@ export function AdminConnectorPageScreen({ connection }: { connection: ExternalM
     || (connection.oauthClientRequired === true && connection.oauthClientConfigured !== true)
     || (connection.authType === "apikey" && connection.credentialMode === "shared" && !connection.connected));
   const [error, setError] = useState<string | null>(null);
+  const [removeRequested, setRemoveRequested] = useState(confirmRemove);
+  const removed = useRef(false);
   const connectionId = connection.id;
   const name = connection.name;
   const native = isNativeProviderConnectionId(connection.id, connection.nativeProviderKey);
@@ -171,8 +192,24 @@ export function AdminConnectorPageScreen({ connection }: { connection: ExternalM
     }
   }
 
+  const pluginNames = connection.requiredBy.map((plugin) => plugin.name);
+  const removeConfirm = {
+    title: `Remove ${name}?`,
+    description: pluginNames.length > 0
+      ? `Nobody can use it anymore, and ${pluginNames.join(", ")} ${pluginNames.length === 1 ? "loses" : "lose"} it. This cannot be undone.`
+      : "Nobody can use it anymore. This cannot be undone.",
+    action: "Remove",
+  };
+
+  function closeRemoveRequest() {
+    setRemoveRequested(false);
+    // Drop ?remove=1 so going back or reloading does not ask again.
+    if (confirmRemove && !removed.current) router.replace(getMcpConnectionRoute(orgSlug, connectionId));
+  }
+
   async function remove() {
     await deleteConnection.mutateAsync(connectionId);
+    removed.current = true;
     toast({ title: `${name} is removed`, description: "Nobody can use it anymore." });
     router.push(getMcpConnectionsRoute(orgSlug));
   }
@@ -202,8 +239,20 @@ export function AdminConnectorPageScreen({ connection }: { connection: ExternalM
               label={`More for ${name}`}
               entries={[
                 { label: "Edit settings", onSelect: () => setSettingsOpen(true) },
-                ...(!native && signedIn ? [{ label: "Test tools", href: `${getToolTesterRoute(orgSlug)}?connectionId=${encodeURIComponent(connectionId)}` }] : []),
-                ...(!native && connection.authType !== "none" && connection.connected ? [{
+                ...(personalDisconnectLabel && assignedConnection ? [{
+                  label: personalDisconnectLabel,
+                  disabled: disconnectMyAccount.isPending,
+                  onSelect: async () => {
+                    try {
+                      await disconnectMyAccount.mutateAsync(assignedConnection);
+                      toast({ title: personalDisconnectLabel === "Remove your key" ? `Your key for ${name} is removed` : `You are signed out of ${name}`, description: "Everyone else stays signed in." });
+                    } catch {
+                      toast({ title: personalDisconnectLabel === "Remove your key" ? `Could not remove your key for ${name}` : `Could not sign out of ${name}`, description: "Try again." });
+                    }
+                  },
+                }] : []),
+                ...(!native && signedIn && memberAccess?.canManageConnections ? [{ label: "Test tools", href: `${getToolTesterRoute(orgSlug)}?connectionId=${encodeURIComponent(connectionId)}` }] : []),
+                ...(!native && connection.authType !== "none" && connection.connected && memberAccess?.canDisconnectAnyConnection ? [{
                   label: "Sign everyone out",
                   onSelect: async () => {
                     await disconnect.mutateAsync(connectionId);
@@ -211,9 +260,10 @@ export function AdminConnectorPageScreen({ connection }: { connection: ExternalM
                   },
                   confirm: { title: `Sign everyone out of ${name}?`, description: "Each person signs in again to use it.", action: "Sign everyone out" },
                 }] : []),
-                ...(aliasOnly ? [] : [removeEntry(name, remove)]),
+                ...(aliasOnly ? [] : [canRemove ? { ...removeEntry(name, remove), confirm: removeConfirm } : { label: "Remove", destructive: true, disabled: true }]),
               ]}
             />
+            {assignedConnection ? <LinkButton href={getLibraryConnectorRoute(orgSlug, assignedConnection.id)}>Open in My Library</LinkButton> : null}
             <ChatButton name={name} />
           </>
         )}
@@ -240,7 +290,7 @@ export function AdminConnectorPageScreen({ connection }: { connection: ExternalM
             members={orgContext.members}
             teams={orgContext.teams}
             owner={null}
-            canShareWithEveryone
+            canShareWithEveryone={canShareWithEveryone}
             everyoneOffDescription={draft.memberIds.length === 0 && draft.teamIds.length === 0
               ? "Off. Nobody has it yet."
               : "Off. Only the people and teams below have it."}
@@ -280,11 +330,25 @@ export function AdminConnectorPageScreen({ connection }: { connection: ExternalM
             />
           </div>
         ) : (
-          <ConnectorSettingsForm key={connection.updatedAt ?? connection.id} connection={connection} onSaved={(message) => toast({ title: message })} />
+          <ConnectorSettingsForm key={connection.updatedAt ?? connection.id} connection={connection} lockedReason={editLockedReason} onSaved={(message) => toast({ title: message })} />
         )}
       </Disclosure>
 
-      {native ? null : <UseInAnotherApp connection={connection} />}
+      {!aliasOnly && !canRemove ? (
+        <p className="flex items-center gap-1.5 text-[13px] text-gray-500" data-testid="connector-remove-locked">
+          <Lock className="h-3.5 w-3.5 shrink-0" strokeWidth={1.5} aria-hidden />
+          {`Only the person who added ${name} can remove it. ${permissionLockReason("connections.delete")}`}
+        </p>
+      ) : null}
+
+      {native ? null : <UseInAnotherApp connection={connection} lockedReason={editLockedReason} />}
+
+      <ConfirmDialog
+        confirm={removeRequested && canRemove && !aliasOnly ? removeConfirm : null}
+        destructive
+        onConfirm={remove}
+        onClose={closeRemoveRequest}
+      />
     </ItemPage>
   );
 }
